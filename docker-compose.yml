@@ -1,0 +1,28 @@
+# 给克隆仓库的人一条零配置起库的路：docker compose up -d
+# 注意：应用侧仍然强制把连接会话时区固定为 UTC（见 internal/store/store.go），
+# 这里的 --default-time-zone 只是让手工用 mysql 客户端排查时看到的也是 UTC。
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: safeguard-mysql
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_0900_ai_ci
+      - --default-time-zone=+00:00
+    environment:
+      MYSQL_ROOT_PASSWORD: safeguard-root
+      MYSQL_DATABASE: safeguard_agent
+      MYSQL_USER: safeguard
+      MYSQL_PASSWORD: safeguard
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-usafeguard", "-psafeguard"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  mysql-data:
