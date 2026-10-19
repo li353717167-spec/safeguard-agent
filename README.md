@@ -101,7 +101,7 @@ go run ./cmd/agent -resume task_xxxxxxxx            # 从断点续跑（用原�
 
 ---
 
-## 四个关键机制
+## 五个关键机制
 
 ### 1）失败要分类，重试要克制
 
@@ -143,6 +143,27 @@ idem_key = sha256(v1 | task_id | step_no | call_index | tool_name | 规范化参
 
 > 代码：`internal/orchestrator/orchestrator.go` 的 `Resume()` / `rebuild()`、`persisted.go` 的放行判断
 
+### 5）审计：变更与拒绝都要留痕
+
+审计**只记变更与拒绝**，不记普通读取——只读调用在 `tool_calls` 里已有完整记录，再写一份只会让噪音淹没关键事件。
+
+顺序是刻意的：**变更前先写"开始"记录，写不进去就拒绝执行**（没有记录的变更不允许发生）；
+变更后写结果，写失败只告警（动作已经发生，不能假装没发生）。
+
+```
+approval.requested → tool.executing → tool.executed
+```
+
+`audit_logs` 只增不删、**不建外键**：任务被删掉、`tool_calls` 级联清空之后，
+"谁在什么时候对哪个服务做了什么"仍然查得到。
+
+```bash
+go run ./cmd/agent -audit all              # 最近 20 条
+go run ./cmd/agent -audit task_xxxxxxxx    # 某个任务的完整链路
+```
+
+> 代码：`internal/store/auditrepo.go`、`orchestrator.go` 的 `auditExecuting`/`auditExecuted`、`tools/spec.go` 的 `Spec.Audit` 钩子
+
 ---
 
 ## 怎么验证它真的对
@@ -157,6 +178,7 @@ idem_key = sha256(v1 | task_id | step_no | call_index | tool_name | 规范化参
 | 恢复不重复副作用 | 挂起 → 审批 → 续跑（真实 MySQL） | 配置只改一次，`config_changes` 仅 1 行，幂等 key 与挂起行相同 |
 | 失败分类靠类型不靠文案 | 连一个必定拒绝的真实端口 | 真实驱动错误被分到"可重试"，共尝试 3 次 |
 | 评测可复现 | 理想模型 / 坏模型 / 真实模型 | 理想 10/10；坏模型被抓出；真实模型 10/10，冗余调用 4 次 |
+| 审计可追溯 | 挂起 → 审批 → 续跑（真实 MySQL） | `approval.requested → tool.executing → tool.executed`，且任务删除后审计存活 |
 
 ```bash
 go test ./... -count=1                                   # 全部离线测试（16 个测试文件）
@@ -185,7 +207,7 @@ go run ./cmd/agent -eval internal/eval/cases.json -eval-model=real    # 真实�
 ## 目录结构
 
 ```
-cmd/agent/                 # CLI：-ask / -approve / -reject / -resume / -eval / -tools / -migrate / -seed
+cmd/agent/                 # CLI：-ask / -approve / -reject / -resume / -audit / -eval / -tools / -migrate / -seed
 internal/
 ├── approval/              # 审批门禁：先落库再挂起（意图 → 工单 → 结束运行）
 ├── config/                # 配置装载（环境变量 + .env，密钥只走环境变量）
@@ -240,15 +262,15 @@ docs/                      # 架构图 / 设计决策 / 代码走读 / 阅读指
 1. **单实例**：状态、工具数据源、审批工单都在一个 MySQL 里，是单点；也没有做多副本部署。
 2. **恢复没有并发保护**：两个进程同时 `-resume` 同一步，都可能看到 `waiting_approval` 就去执行。修法是给 `BeginIntent` 加 CAS（`UPDATE ... WHERE status IN (...)`）。
 3. **回放的结果没有时间戳**：模型无法判断"这是多久以前的读数"。
-4. **审计未接入执行路径**：`audit_logs` 表已建好（只增不删、无外键），但写工具执行时还没往里写。
-5. **评测集小**：10 道题只能证明框架跑通，不能当能力基准。
-6. **并发多调用未验证**：一次工具调用 = 一步，`call_index` 恒为 1，一轮多调用的并发路径没跑过。
+4. **评测集小**：10 道题只能证明框架跑通，不能当能力基准。
+5. **并发多调用未验证**：一次工具调用 = 一步，`call_index` 恒为 1，一轮多调用的并发路径没跑过。
+6. **审计只覆盖变更与拒绝**：只读调用没有审计记录（设计选择，见上）。
 
 ---
 
 ## Roadmap
 
-- [ ] 审计接入执行路径（谁、在什么任务里、对什么对象、做了什么变更）
+- [x] 审计接入执行路径（变更与拒绝留痕，先落库再执行）
 - [ ] 恢复的并发保护（状态 CAS）
 - [ ] 回放结果带 `as_of`，提示模型"这是历史结果"
 - [ ] 评测集扩到 50+，加入故障注入用例

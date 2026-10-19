@@ -65,6 +65,7 @@ func realMain(args []string) int {
 	reject := fs.String("reject", "", "拒绝指定工单（tk_...）后退出")
 	rejectReason := fs.String("reason", "", "配合 -reject：拒绝理由（会被回喂给模型）")
 	resumeID := fs.String("resume", "", "从断点恢复指定任务（task_...）并继续执行")
+	auditArg := fs.String("audit", "", "查看审计：传 task_... 看该任务，传 all 看最近 20 条")
 	evalCases := fs.String("eval", "", "跑评测：指定评测集 JSON 路径（如 internal/eval/cases.json）")
 	evalModel := fs.String("eval-model", "fake", "评测用模型：fake（理想模型，验证判分器）| broken（坏模型，验证判分能发现错误）| real（真实模型）")
 	evalOut := fs.String("eval-out", "", "把评测报告写成 Markdown 到指定路径")
@@ -85,6 +86,7 @@ func realMain(args []string) int {
 			"  safeguard-agent -approve <tk_...>\n"+
 			"  safeguard-agent -reject <tk_...> -reason \"...\"\n"+
 			"  safeguard-agent -resume <task_...>\n"+
+			"  safeguard-agent -audit <task_...|all>\n"+
 			"  safeguard-agent -eval internal/eval/cases.json -eval-model=fake\n"+
 			"  safeguard-agent -migrate\n"+
 			"  safeguard-agent -seed\n"+
@@ -137,6 +139,8 @@ func realMain(args []string) int {
 		return runDecide(ctx, cfg, strings.TrimSpace(*reject), store.ApprovalStatusRejected, "cli-user", *rejectReason)
 	case strings.TrimSpace(*resumeID) != "":
 		return runResume(ctx, cfg, strings.TrimSpace(*resumeID), *timeout, *showRaw)
+	case strings.TrimSpace(*auditArg) != "":
+		return runAudit(ctx, cfg, strings.TrimSpace(*auditArg))
 	case strings.TrimSpace(*evalCases) != "":
 		return runEval(ctx, cfg, strings.TrimSpace(*evalCases), *evalModel, *evalOut, *evalJudge, *timeout)
 	case *doMigrate:
@@ -366,6 +370,54 @@ func runApprovals(ctx context.Context, cfg config.Config) int {
 	return exitOK
 }
 
+// runAudit 打印审计时间线。
+//
+// 审计只增不删，所以它比任务状态"活得久"：任务被删掉之后，
+// 仍然能查到"谁在什么时候对哪个服务做了什么"。
+func runAudit(ctx context.Context, cfg config.Config, arg string) int {
+	if err := cfg.DB.Validate(); err != nil {
+		fmt.Fprintf(os.Stderr, "配置错误: %v\n", err)
+		return exitUsage
+	}
+	st, err := openStore(ctx, cfg)
+	if err != nil {
+		slog.Error("连接数据库失败", "err", err)
+		return exitFailure
+	}
+	defer st.Close()
+
+	repo := store.NewAuditRepo(st.GORM())
+	var rows []store.AuditLog
+	if arg == "all" {
+		rows, err = repo.ListRecent(ctx, 20)
+	} else {
+		rows, err = repo.ListByTask(ctx, arg)
+	}
+	if err != nil {
+		slog.Error("读取审计失败", "err", err)
+		return exitFailure
+	}
+	if len(rows) == 0 {
+		fmt.Println("--- 没有审计记录 ---")
+		return exitOK
+	}
+
+	fmt.Printf("--- 审计（%d 条）---\n", len(rows))
+	for _, r := range rows {
+		target := "-"
+		if r.Target != nil {
+			target = *r.Target
+		}
+		detail := "-"
+		if r.Detail != nil {
+			detail = truncateRunes(*r.Detail, 70)
+		}
+		fmt.Printf("%s  %-20s %-22s %-16s %s\n",
+			r.CreatedAt.Format("01-02 15:04:05"), r.Action, target, r.Actor, detail)
+	}
+	return exitOK
+}
+
 // runDecide 批准或拒绝一张工单。
 func runDecide(ctx context.Context, cfg config.Config, ticketID, status, approver, reason string) int {
 	gate, st, code := openGate(ctx, cfg)
@@ -378,6 +430,16 @@ func runDecide(ctx context.Context, cfg config.Config, ticketID, status, approve
 	if err != nil {
 		slog.Error("处理审批失败", "ticket", ticketID, "err", err)
 		return exitFailure
+	}
+	// 审批是"人做的决定"，必须留痕：actor 记录到具体审批人。
+	if auditErr := store.NewAuditRepo(st.GORM()).Record(ctx, store.AuditEvent{
+		TaskID: ticket.TaskID,
+		Actor:  store.ActorApprover + approver,
+		Action: store.AuditApprovalDecided,
+		Target: ticket.ToolName,
+		Detail: map[string]any{"ticket_id": ticket.TicketID, "status": ticket.Status, "reason": reason},
+	}); auditErr != nil {
+		slog.Error("写审批审计失败", "ticket", ticketID, "err", auditErr)
 	}
 
 	action := "批准"
@@ -609,6 +671,7 @@ func runResume(ctx context.Context, cfg config.Config, taskID string, timeoutOve
 		Runner:      executor.NewPersisted(exec, toolCalls),
 		Policy:      policy.New(),
 		Gate:        gate,
+		Auditor:     store.NewAuditRepo(st.GORM()),
 		OnEvent:     printOrchestratorEvent,
 	})
 
@@ -617,6 +680,15 @@ func runResume(ctx context.Context, cfg config.Config, taskID string, timeoutOve
 	if err != nil {
 		slog.Error("恢复失败", "task_id", taskID, "err", err)
 		return exitFailure
+	}
+	// 谁在什么时候恢复了哪个任务——审计要能回答这个问题。
+	if auditErr := store.NewAuditRepo(st.GORM()).Record(ctx, store.AuditEvent{
+		TaskID: taskID,
+		Actor:  store.ActorCLI,
+		Action: store.AuditTaskResumed,
+		Detail: map[string]any{"stop": string(res.Stop), "tool_calls": res.ToolCalls, "rounds": res.Rounds},
+	}); auditErr != nil {
+		slog.Error("写恢复审计失败", "task_id", taskID, "err", auditErr)
 	}
 
 	fmt.Println("--- 最终回答 ---")
@@ -681,6 +753,7 @@ func runAsk(ctx context.Context, cfg config.Config, question string, timeoutOver
 		// D6：策略引擎（纯规则）+ 审批门禁（先落库再挂起）。
 		Policy:  policy.New(),
 		Gate:    approval.NewGate(toolCalls, store.NewApprovalRepo(st.GORM())),
+		Auditor: store.NewAuditRepo(st.GORM()),
 		OnEvent: printOrchestratorEvent,
 	})
 

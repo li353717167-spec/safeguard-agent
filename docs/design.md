@@ -784,3 +784,60 @@ r.handleAndRecord(ctx, resume.pendingRound, resume.pendingStepNo, *resume.pendin
 评测要可复现。连真库会引入"上一条用例改了配置"这种隐式耦合，指标就不可比了。
 所以评测用与 `-seed` 一致的内存数据源；**真实 SQL 路径由集成测试覆盖**
 （D5/D6/D7 各有一个真实库测试）。这不是偷懒，是把两种验证放在各自合适的位置。
+---
+
+## 18. 审计落地（D15）：只记变更与拒绝
+
+### 18.1 只记什么
+
+| 记 | 不记 |
+|---|---|
+| 被拒绝的调用（`tool.denied`） | 普通只读调用 |
+| 变更的开始（`tool.executing`） | dry-run 预览（它没有产生变更） |
+| 变更的结果（`tool.executed`） | 每次模型调用的 token 用量（那是指标，不是审计） |
+| 审批请求与结论（`approval.requested` / `approval.decided`） | |
+| 断点恢复（`task.resumed`） | |
+
+理由：只读调用在 `tool_calls` 里已经有完整记录，再写一份审计只是把 90% 的噪音盖在 10% 的关键事件上。
+审计要回答的是"**谁在什么时候改了什么东西、谁拦下了什么**"。
+
+### 18.2 顺序：先落库，再执行
+
+```
+① 写 tool.executing（变更意图）  → 失败则拒绝执行
+② 执行变更
+③ 写 tool.executed（结果摘要）
+```
+
+第 ① 步失败时**拒绝执行**：没有记录的变更不允许发生。这是"先落库再挂起"的同一条原则
+在审计上的复用——**先写下你要做的事，再去做**。
+
+第 ③ 步失败时只告警：动作已经发生，不能因为审计写失败就假装没发生（那才是真正的审计造假）。
+
+### 18.3 谁来声明"这次会不会变更"
+
+`Spec.Audit func(rawArgs) (target string, mutating bool, err error)` —— 又一个工具侧钩子
+（和 `Preview` / `ApprovalCheck` 同一个模式）。
+
+为什么必须由工具声明：`update_config` 的 **dry-run 只返回预览**，它不是变更。
+只有工具自己知道 `dry_run` 参数是什么意思，编排层不该解析参数。
+
+### 18.4 为什么审计表没有外键
+
+任务删除时 `tool_calls` / `task_steps` 会级联清空（执行状态可以重建），
+但"谁在什么时候改过 checkout-service"必须留下——这正是审计的目的是**在业务数据消失之后仍然可查**。
+所以 `audit_logs.task_id` 是普通列（可空），**不建外键**。
+
+实测：挂起 → 审批 → 继续执行后，审计链路是 `approval.requested → tool.executing → tool.executed`；
+删除任务后这三条记录仍然在（`TestRealDBAuditTrail`）。
+
+### 18.5 actor 模型
+
+| actor | 谁 |
+|---|---|
+| `system:agent` | Agent 自身发起的工具请求（模型提议、编排层执行） |
+| `user:cli` | 命令行用户发起的动作（恢复任务） |
+| `approver:<id>` | 人工审批人 |
+| `system` | 系统行为（超时清理等） |
+
+接 SSO 之后把 `user:cli` 换成真实用户即可，表结构不用动。
