@@ -138,6 +138,15 @@ type ToolRunner interface {
 	Run(ctx context.Context, tool tools.Tool, rawArgs json.RawMessage, ref executor.CallRef) executor.Outcome
 }
 
+// Auditor 是审计写入能力。
+//
+// 接口定义在消费方：评测与单元测试可以塞一个内存实现，完全不需要数据库。
+// **只记录变更与拒绝**——只读调用在 tool_calls 里已有完整记录，
+// 往审计里再写一份只会让 90% 的噪音淹没 10% 的关键事件。
+type Auditor interface {
+	Record(ctx context.Context, e store.AuditEvent) error
+}
+
 // Options 是编排器的可调项。
 type Options struct {
 	Limits       Limits
@@ -152,7 +161,9 @@ type Options struct {
 	Policy *policy.Engine
 	// Gate 是审批门禁（先落库再挂起）。留空表示没有审批子系统——
 	// 此时需要审批的工具会被**直接拒绝**（fail closed），而不会被静默执行。
-	Gate    *approval.Gate
+	Gate *approval.Gate
+	// Auditor 是审计写入。留空则不记审计（评测与单测用）。
+	Auditor Auditor
 	OnEvent func(Event)
 	now     func() time.Time
 }
@@ -165,6 +176,7 @@ type Orchestrator struct {
 	runner   ToolRunner
 	policy   *policy.Engine
 	gate     *approval.Gate
+	auditor  Auditor
 	opts     Options
 }
 
@@ -187,7 +199,7 @@ func New(client llm.Client, registry *tools.Registry, state StateStore, opts Opt
 	}
 	return &Orchestrator{
 		client: client, registry: registry, state: state,
-		runner: opts.Runner, policy: opts.Policy, gate: opts.Gate, opts: opts,
+		runner: opts.Runner, policy: opts.Policy, gate: opts.Gate, auditor: opts.Auditor, opts: opts,
 	}
 }
 
@@ -559,6 +571,7 @@ func (r *run) processToolCall(ctx context.Context, round, stepNo int, call llm.T
 	if !ok {
 		trace.Error = "未注册的工具"
 		trace.Summary = fmt.Sprintf("模型请求了未注册的工具 %q", call.Function.Name)
+		r.auditDenied(ctx, stepNo, call.Function.Name, call.Function.Name, "unknown_tool", call.Function.Arguments)
 		return trace, toolError(call.ID, "unknown_tool",
 			fmt.Sprintf("工具 %q 不存在。当前可用的工具只有：%s",
 				call.Function.Name, strings.Join(r.o.registry.Names(), ", "))), false, nil
@@ -572,6 +585,7 @@ func (r *run) processToolCall(ctx context.Context, round, stepNo int, call llm.T
 		trace.Error = err.Error()
 		trace.Class = executor.ClassBadInput.String()
 		trace.Summary = "参数不合法（未进入审批与执行）"
+		r.auditDenied(ctx, stepNo, spec.Name, r.auditTargetFallback(spec, call.Function.Arguments), "bad_args", call.Function.Arguments)
 		return trace, toolError(call.ID, "bad_args", err.Error()+"；请修正参数后重试"), false, nil
 	}
 
@@ -595,7 +609,21 @@ func (r *run) processToolCall(ctx context.Context, round, stepNo int, call llm.T
 		execCtx = executor.WithApprovalGranted(ctx)
 	}
 
-	// ⑤ 执行。超时、异常分类、退避重试、熔断在 D4 的执行器里；
+	// ⑤ 变更类调用：**先写"开始"审计，再执行**。
+	//    审计写不进去就拒绝执行——没有记录的变更不允许发生。
+	//    只读工具不写审计（读没有副作用，不值得为它承担可用性代价）。
+	target, mutating := r.auditInfo(spec, call.Function.Arguments)
+	if mutating && r.o.auditor != nil {
+		if err := r.auditExecuting(ctx, stepNo, spec, call.Function.Arguments, target); err != nil {
+			trace.Error = "审计写入失败"
+			trace.Class = executor.ClassFatal.String()
+			trace.Summary = "审计不可用，拒绝执行变更"
+			return trace, toolError(call.ID, "audit_unavailable",
+				"审计系统不可用，为满足合规要求已拒绝执行这次变更；请稍后重试。"), false, nil
+		}
+	}
+
+	// ⑥ 执行。超时、异常分类、退避重试、熔断在 D4 的执行器里；
 	//    D5 起由带落库的执行器接管：写意图 → 调下游 → 写结果，并支持回放。
 	out := r.o.runner.Run(execCtx, tool, json.RawMessage(call.Function.Arguments), executor.CallRef{
 		TaskID:    r.taskID,
@@ -620,6 +648,9 @@ func (r *run) processToolCall(ctx context.Context, round, stepNo int, call llm.T
 			// 让轨迹里能直接看出"这次成功是重试换来的"——排障时这个信息很值钱。
 			trace.Summary = fmt.Sprintf("%s（重试 %d 次后成功）", trace.Summary, len(out.Attempts)-1)
 		}
+		if mutating {
+			r.auditExecuted(ctx, stepNo, spec, target, out)
+		}
 		return trace, llm.Message{
 			Role:       llm.RoleTool,
 			ToolCallID: call.ID,
@@ -630,6 +661,9 @@ func (r *run) processToolCall(ctx context.Context, round, stepNo int, call llm.T
 
 	// 失败：先落步骤（记录分类与尝试次数），再按分类决定回喂时怎么措辞。
 	trace.Error = out.Error.Error()
+	if mutating {
+		r.auditExecuted(ctx, stepNo, spec, target, out)
+	}
 
 	switch out.Class {
 	case executor.ClassBadInput:
@@ -672,6 +706,7 @@ func (r *run) resolveApproval(ctx context.Context, tool tools.Tool, trace ToolTr
 		trace.Rejected = true
 		trace.Error = "需要审批（未配置审批子系统）"
 		trace.Summary = fmt.Sprintf("拒绝执行 %s（tier=%s，需人工审批）", spec.Name, spec.Tier)
+		r.auditDenied(ctx, stepNo, spec.Name, r.auditTargetFallback(spec, call.Function.Arguments), "no_approval_subsystem", call.Function.Arguments)
 		return trace, toolError(call.ID, "needs_approval",
 			fmt.Sprintf("工具 %s 需要人工审批（角色=%s），但当前没有配置审批子系统，因此拒绝执行。请向用户说明你打算做什么。",
 				spec.Name, decision.Role)), false, nil
@@ -741,6 +776,7 @@ func (r *run) resolveApproval(ctx context.Context, tool tools.Tool, trace ToolTr
 		trace.Class = "waiting_approval"
 		trace.IdemKey = idemKey
 		trace.Summary = fmt.Sprintf("等待人工审批：工单 %s（%s）", parked.Ticket.TicketID, preview)
+		r.auditApprovalRequested(ctx, stepNo, spec, r.auditTargetFallback(spec, call.Function.Arguments), parked.Ticket.TicketID, preview)
 		r.parked = &parked.Ticket
 		return trace, toolError(call.ID, "waiting_approval",
 			fmt.Sprintf("工具 %s 需要人工审批，已生成工单 %s；审批完成前不会执行。", spec.Name, parked.Ticket.TicketID)), false, nil
@@ -936,4 +972,98 @@ func newTaskID() (string, error) {
 		return "", fmt.Errorf("orchestrator: 生成任务 ID 失败: %w", err)
 	}
 	return "task_" + hex.EncodeToString(buf), nil
+}
+
+// ---------------------------------------------------------------------------
+// 审计
+// ---------------------------------------------------------------------------
+
+// audit 写一条审计。未配置 auditor 时静默跳过（评测与单测不需要数据库）。
+func (r *run) audit(ctx context.Context, action, target string, detail map[string]any) error {
+	if r.o.auditor == nil {
+		return nil
+	}
+	return r.o.auditor.Record(ctx, store.AuditEvent{
+		TaskID: r.taskID,
+		Actor:  store.ActorAgent,
+		Action: action,
+		Target: target,
+		Detail: detail,
+	})
+}
+
+// auditDenied 记录一次被拒绝的调用。
+//
+// 拒绝没有产生变更，所以审计失败**不阻断**主流程；但绝不能静默——写不动就大声记日志。
+func (r *run) auditDenied(ctx context.Context, stepNo int, toolName, target, reason, args string) {
+	err := r.audit(ctx, store.AuditToolDenied, target, map[string]any{
+		"step": stepNo, "tool": toolName, "reason": reason, "args": truncateArg(args),
+	})
+	if err != nil {
+		slog.Error("审计写入失败（拒绝事件）", "task_id", r.taskID, "step", stepNo, "err", err)
+	}
+}
+
+// auditExecuting 在变更执行**之前**写"开始"记录。
+// 返回错误时调用方必须拒绝执行：没有记录的变更不允许发生。
+func (r *run) auditExecuting(ctx context.Context, stepNo int, spec tools.Spec, args, target string) error {
+	return r.audit(ctx, store.AuditToolExecuting, target, map[string]any{
+		"step": stepNo, "tool": spec.Name, "tier": int8(spec.Tier), "args": truncateArg(args),
+	})
+}
+
+// auditExecuted 在执行之后写结果。
+// 这里只告警不阻断：动作已经发生，不能因为审计失败就假装没发生。
+func (r *run) auditExecuted(ctx context.Context, stepNo int, spec tools.Spec, target string, out executor.Outcome) {
+	detail := map[string]any{
+		"step": stepNo, "tool": spec.Name, "tier": int8(spec.Tier),
+		"ok": out.Error == nil, "class": out.Class.String(),
+		"attempts": len(out.Attempts), "duration_ms": out.Duration.Milliseconds(),
+		"replayed": out.Replayed, "idem_key": out.IdemKey,
+	}
+	if out.Error == nil {
+		detail["summary"] = out.Result.Summary
+	} else {
+		detail["error"] = out.Error.Error()
+	}
+	if err := r.audit(ctx, store.AuditToolExecuted, target, detail); err != nil {
+		slog.Error("审计写入失败（变更已执行）", "task_id", r.taskID, "step", stepNo, "err", err)
+	}
+}
+
+// auditApprovalRequested 记录"挂起并生成工单"。
+func (r *run) auditApprovalRequested(ctx context.Context, stepNo int, spec tools.Spec, target, ticketID, preview string) {
+	if err := r.audit(ctx, store.AuditApprovalRequested, target, map[string]any{
+		"step": stepNo, "tool": spec.Name, "ticket_id": ticketID, "preview": preview,
+	}); err != nil {
+		slog.Error("审计写入失败（审批请求）", "task_id", r.taskID, "step", stepNo, "err", err)
+	}
+}
+
+// auditInfo 由工具自己声明"审计要记的目标"和"这次会不会产生变更"。
+// 编排层不解析参数——参数语义留在工具里（和 Preview / ApprovalCheck 同一个模式）。
+func (r *run) auditInfo(spec tools.Spec, args string) (target string, mutating bool) {
+	if spec.Audit == nil {
+		return spec.Name, false
+	}
+	t, m, err := spec.Audit(json.RawMessage(args))
+	if err != nil || strings.TrimSpace(t) == "" {
+		return spec.Name, false
+	}
+	return t, m
+}
+
+// auditTargetFallback 只取 target：拒绝事件没有产生变更，只关心"操作对象是谁"。
+func (r *run) auditTargetFallback(spec tools.Spec, args string) string {
+	target, _ := r.auditInfo(spec, args)
+	return target
+}
+
+// truncateArg 限制写进审计的参数长度（审计是给人看的，不是全量备份）。
+func truncateArg(args string) string {
+	const limit = 512
+	if len(args) <= limit {
+		return args
+	}
+	return args[:limit] + "…(截断)"
 }

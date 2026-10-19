@@ -98,6 +98,15 @@ func newUpdateConfigTool(ds WriteDataSource) Tool {
 			}
 			return true, "真正修改配置需要人工审批"
 		},
+		// 预览（dry_run 未给或为 true）不算变更，不写审计的执行记录。
+		Audit: func(rawArgs json.RawMessage) (string, bool, error) {
+			args, err := decodeArgs[updateConfigArgs](rawArgs)
+			if err != nil {
+				return "", false, err
+			}
+			mutating := args.DryRun != nil && !*args.DryRun
+			return args.Service, mutating, nil
+		},
 		Preview: func(ctx context.Context, rawArgs json.RawMessage) (string, error) {
 			args, err := decodeArgs[updateConfigArgs](rawArgs)
 			if err != nil {
@@ -214,6 +223,13 @@ func newRestartServiceTool(ds WriteDataSource) Tool {
 		// 重启不是幂等操作：重复执行会真的再重启一次。所以 MaxRetry 必须为 0。
 		MaxRetry:   0,
 		Idempotent: false,
+		Audit: func(rawArgs json.RawMessage) (string, bool, error) {
+			args, err := decodeArgs[restartServiceArgs](rawArgs)
+			if err != nil {
+				return "", false, err
+			}
+			return args.Service, true, nil // 重启一定会产生变更
+		},
 		Preview: func(_ context.Context, rawArgs json.RawMessage) (string, error) {
 			args, err := decodeArgs[restartServiceArgs](rawArgs)
 			if err != nil {
@@ -288,6 +304,13 @@ func newScaleServiceTool(ds WriteDataSource) Tool {
 		MaxRetry:        1,
 		// 把副本数设成同一个值是幂等的（不是"加 N 个副本"），所以允许一次重试。
 		Idempotent: true,
+		Audit: func(rawArgs json.RawMessage) (string, bool, error) {
+			args, err := decodeArgs[scaleServiceArgs](rawArgs)
+			if err != nil {
+				return "", false, err
+			}
+			return args.Service, true, nil // 改副本数一定会产生变更
+		},
 		Preview: func(_ context.Context, rawArgs json.RawMessage) (string, error) {
 			args, err := decodeArgs[scaleServiceArgs](rawArgs)
 			if err != nil {

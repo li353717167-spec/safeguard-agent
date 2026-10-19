@@ -81,6 +81,17 @@ type Spec struct {
 	// 它仍然把"参数语义"留在工具里：策略引擎只调用这个钩子，自己不解析参数。
 	// ⚠️ 高危工具不接受钩子放宽（见 policy.Engine），避免某个工具不小心把审批关掉。
 	ApprovalCheck func(rawArgs json.RawMessage) (require bool, reason string)
+
+	// Audit 是可选钩子：告诉编排层"这次调用审计时怎么写"。
+	//
+	// 返回两个值：
+	//   - target：被操作对象（审计的 target 列），例如 payment-service；
+	//   - mutating：这次调用**是否会产生变更**。
+	//
+	// 为什么要区分 mutating：update_config 的 dry-run 只返回预览，
+	// 它不应该被记成一次"变更"。而"会不会真改"只有工具自己知道
+	// （取决于 dry_run 参数），所以由工具声明——和 Preview / ApprovalCheck 同一个模式。
+	Audit func(rawArgs json.RawMessage) (target string, mutating bool, err error)
 }
 
 // Result 是工具执行的规范化输出。

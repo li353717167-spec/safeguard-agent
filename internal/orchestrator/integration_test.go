@@ -299,3 +299,111 @@ func TestRealDBResumeAfterApproval(t *testing.T) {
 	}
 	t.Logf("恢复完成：task=%s key=%s 配置=%s→%s 台账=%d 行", taskID, parkedKey, oldValue, gotValue, changeCount)
 }
+
+// TestRealDBAuditTrail 在真实 MySQL 上验证审计落地：
+// 变更前写"开始"、变更后写结果、任务删除后审计仍然存活（只增不删）。
+func TestRealDBAuditTrail(t *testing.T) {
+	dsn := os.Getenv("SAFEGUARD_TEST_DB_DSN")
+	if dsn == "" {
+		t.Skip("未设置 SAFEGUARD_TEST_DB_DSN，跳过真实数据库集成测试")
+	}
+
+	ctx := context.Background()
+	st, err := store.Open(ctx, store.Config{DSN: dsn})
+	if err != nil {
+		t.Fatalf("连接数据库失败: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	ds := tools.NewMySQLDataSource(st.GORM())
+	reg, err := tools.NewFullRegistry(ds, ds)
+	if err != nil {
+		t.Fatalf("注册工具失败: %v", err)
+	}
+
+	taskID := fmt.Sprintf("task_it_audit_%d", time.Now().UnixNano())
+	gate := approval.NewGate(store.NewToolCallRepo(st.GORM()), store.NewApprovalRepo(st.GORM()))
+	auditRepo := store.NewAuditRepo(st.GORM())
+
+	t.Cleanup(func() {
+		// 审计只增不删，但测试不该在演示数据里留痕：显式清掉本用例产生的记录。
+		_ = st.GORM().Where("task_id = ?", taskID).Delete(&store.AuditLog{}).Error
+		_ = st.GORM().Where("task_id = ?", taskID).Delete(&store.Task{}).Error
+		_ = st.GORM().Where("task_id = ?", taskID).Delete(&store.Approval{}).Error
+		// restart 会把 checkout-service 置成 healthy，恢复成 seed 的 degraded
+		_ = st.GORM().Exec("UPDATE services SET status = 'degraded' WHERE name = 'checkout-service'").Error
+	})
+
+	client := &fakeLLM{responses: []llm.ChatResponse{
+		toolCallResponse(call("call_1", "restart_service", `{"service":"checkout-service","reason":"错误率上升"}`)),
+		answerResponse("已重启。"),
+	}}
+	o := New(client, reg, store.NewTaskRepo(st.GORM()), Options{
+		TaskID:  taskID,
+		Gate:    gate,
+		Auditor: auditRepo,
+	})
+
+	res, err := o.Run(ctx, "重启 checkout-service")
+	if err != nil || !res.WaitingApproval() {
+		t.Fatalf("应当挂起: err=%v stop=%s", err, res.Stop)
+	}
+
+	// 挂起阶段：应有 approval.requested
+	rows, err := auditRepo.ListByTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("读取审计失败: %v", err)
+	}
+	if !hasAction(rows, store.AuditApprovalRequested) {
+		t.Fatalf("缺少 approval.requested，实际: %v", actionsOf(rows))
+	}
+
+	// 审批 + 恢复：应补上 tool.executing 与 tool.executed
+	if _, err := gate.Decide(ctx, res.Ticket.TicketID, store.ApprovalStatusApproved, "tester", "同意"); err != nil {
+		t.Fatalf("审批失败: %v", err)
+	}
+	if _, err := o.Resume(ctx, taskID); err != nil {
+		t.Fatalf("恢复失败: %v", err)
+	}
+
+	rows, err = auditRepo.ListByTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("读取审计失败: %v", err)
+	}
+	for _, want := range []string{store.AuditApprovalRequested, store.AuditToolExecuting, store.AuditToolExecuted} {
+		if !hasAction(rows, want) {
+			t.Errorf("缺少 %s，实际: %v", want, actionsOf(rows))
+		}
+	}
+	before := len(rows)
+
+	// 删除任务 → tool_calls 级联清空，但审计必须留下
+	if err := st.GORM().Where("task_id = ?", taskID).Delete(&store.Task{}).Error; err != nil {
+		t.Fatalf("删除任务失败: %v", err)
+	}
+	rows, err = auditRepo.ListByTask(ctx, taskID)
+	if err != nil {
+		t.Fatalf("删除后读取审计失败: %v", err)
+	}
+	if len(rows) != before {
+		t.Errorf("任务删除后审计应存活：删除前 %d 条，删除后 %d 条", before, len(rows))
+	}
+	t.Logf("审计链路: %v", actionsOf(rows))
+}
+
+func hasAction(rows []store.AuditLog, action string) bool {
+	for _, r := range rows {
+		if r.Action == action {
+			return true
+		}
+	}
+	return false
+}
+
+func actionsOf(rows []store.AuditLog) []string {
+	out := make([]string, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, r.Action)
+	}
+	return out
+}
