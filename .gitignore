@@ -1,0 +1,30 @@
+# 本地配置与密钥：绝不入库
+.env
+.env.*
+!.env.example
+
+# 构建产物
+/bin/
+*.exe
+*.test
+*.out
+*.zip
+
+# Go 工具链缓存（本机把缓存放在工作区内，随时可删）
+/.gocache/
+/.gomodcache/
+/.gotmp/
+/.tools/
+
+# 运行期数据
+/data/
+*.log
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# 操作系统
+.DS_Store
+Thumbs.db

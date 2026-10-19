@@ -1,0 +1,27 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+
+      - name: gofmt
+        run: |
+          out=$(gofmt -l ./cmd ./internal)
+          if [ -n "$out" ]; then echo "需要 gofmt: $out"; exit 1; fi
+
+      - name: vet
+        run: go vet ./...
+
+      # 真实数据库的集成测试靠 SAFEGUARD_TEST_DB_DSN 开关，CI 里没有就自动跳过
+      - name: test
+        run: go test ./... -count=1
