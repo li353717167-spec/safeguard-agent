@@ -49,6 +49,7 @@ const (
 // 而不是一条异常日志。
 const (
 	ToolCallStatusStarted         = "started"
+	ToolCallStatusExecuting       = "executing"
 	ToolCallStatusWaitingApproval = "waiting_approval"
 	ToolCallStatusSuccess         = "success"
 	ToolCallStatusFailed          = "failed"
@@ -111,6 +112,10 @@ type ToolCall struct {
 	RetryCount int        `gorm:"column:retry_count;not null"`
 	StartedAt  time.Time  `gorm:"column:started_at;not null"`
 	FinishedAt *time.Time `gorm:"column:finished_at"`
+	// 执行租约：抢占执行权用（0004_claim.sql）。attempt 记录被抢到几次，便于发现"超时被重抢"。
+	ClaimOwner     *string    `gorm:"column:claim_owner;size:64"`
+	ClaimExpiresAt *time.Time `gorm:"column:claim_expires_at"`
+	Attempt        int        `gorm:"column:attempt;not null"`
 }
 
 func (ToolCall) TableName() string { return "tool_calls" }

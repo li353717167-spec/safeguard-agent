@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -12,27 +13,88 @@ import (
 	"github.com/mechrevo/safeguard-agent/internal/tools"
 )
 
-// memToolCallStore 是内存版 ToolCallStore：模拟 tool_calls 表的主键与三段式写入。
+// memToolCallStore 是内存版 ToolCallStore：模拟 tool_calls 表的主键、三段式写入与执行租约。
+//
+// 加锁是必须的：并发保护测试会真的从多个 goroutine 同时调 Claim。
 type memToolCallStore struct {
+	mu          sync.Mutex
 	rows        map[string]*store.ToolCall
 	recordCalls int
 	failRecord  bool
+	now         func() time.Time
+	// claimCalls 记录 Claim 被调用的次数（验证"每个调用都尝试过抢"）。
+	claimCalls int
 }
 
 func newMemStore() *memToolCallStore {
-	return &memToolCallStore{rows: map[string]*store.ToolCall{}}
+	return &memToolCallStore{
+		rows: map[string]*store.ToolCall{},
+		now:  func() time.Time { return time.Now().UTC() },
+	}
 }
 
 func (m *memToolCallStore) BeginIntent(_ context.Context, tc *store.ToolCall) (*store.ToolCall, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if existing, ok := m.rows[tc.IdemKey]; ok {
-		return existing, true, nil
+		copied := *existing
+		return &copied, true, nil
 	}
 	copied := *tc
 	m.rows[tc.IdemKey] = &copied
 	return nil, false, nil
 }
 
+// Claim 与 store.ToolCallRepo.Claim 同样的语义：一次原子操作决定"谁能执行"。
+func (m *memToolCallStore) Claim(_ context.Context, idemKey, owner string, lease time.Duration, allowApproval bool) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.claimCalls++
+	row, ok := m.rows[idemKey]
+	if !ok {
+		return false, errors.New("模拟：意图记录缺失")
+	}
+
+	now := m.now()
+	switch row.Status {
+	case store.ToolCallStatusStarted:
+		// 可抢
+	case store.ToolCallStatusWaitingApproval:
+		if !allowApproval {
+			return false, nil // 没获批，不许抢
+		}
+	case store.ToolCallStatusExecuting:
+		// 只有租约过期才允许重抢
+		if row.ClaimExpiresAt != nil && row.ClaimExpiresAt.After(now) {
+			return false, nil
+		}
+	default:
+		return false, nil // success / failed / skipped 都是终态
+	}
+
+	row.Status = store.ToolCallStatusExecuting
+	row.ClaimOwner = &owner
+	expires := now.Add(lease)
+	row.ClaimExpiresAt = &expires
+	row.Attempt++
+	return true, nil
+}
+
+func (m *memToolCallStore) Get(_ context.Context, idemKey string) (store.ToolCall, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	row, ok := m.rows[idemKey]
+	if !ok {
+		return store.ToolCall{}, errors.New("模拟：意图记录缺失")
+	}
+	return *row, nil
+}
+
 func (m *memToolCallStore) RecordResult(_ context.Context, idemKey string, res store.ToolCallResult) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
 	if m.failRecord {
 		return errors.New("模拟：数据库写失败")
 	}
@@ -47,6 +109,9 @@ func (m *memToolCallStore) RecordResult(_ context.Context, idemKey string, res s
 	row.ErrMessage = res.ErrMessage
 	row.RetryCount = res.RetryCount
 	row.FinishedAt = &res.FinishedAt
+	// 执行结束释放租约（与真实仓储一致）
+	row.ClaimOwner = nil
+	row.ClaimExpiresAt = nil
 	return nil
 }
 
@@ -57,6 +122,8 @@ type countingTool struct {
 	// failTimes 次失败（用 err），之后成功
 	failTimes int
 	calls     int
+	// delay 模拟"执行得慢"的工具：并发测试要让它真的占用执行窗口。
+	delay time.Duration
 }
 
 func (c *countingTool) Spec() tools.Spec { return c.spec }
@@ -65,6 +132,9 @@ func (c *countingTool) Validate(json.RawMessage) error { return nil }
 
 func (c *countingTool) Invoke(context.Context, json.RawMessage) (tools.Result, error) {
 	c.calls++
+	if c.delay > 0 {
+		time.Sleep(c.delay)
+	}
 	if c.calls <= c.failTimes {
 		return tools.Result{}, c.err
 	}
@@ -325,4 +395,153 @@ func TestStoreErrClassMapping(t *testing.T) {
 			t.Errorf("toStoreErrClass(%s) = %d, 期望 %d", class, got, want)
 		}
 	}
+}
+
+// ---------------------------------------------------------------------------
+// 并发保护：CAS + 租约
+// ---------------------------------------------------------------------------
+
+// TestClaimConcurrentResumeOnlyOneExecutes 是本轮的核心验收：
+// 两个执行者同时处理**同一个逻辑调用**（例如两个进程同时 -resume），
+// 只能有一个真的执行，另一个必须拿到"处理中"。
+//
+// 注意这不是幂等 key 能解决的问题：两边都还没成功，key 拦不住任何一方。
+func TestClaimConcurrentResumeOnlyOneExecutes(t *testing.T) {
+	mem := newMemStore()
+	pe, _ := persistedTestExecutor(fastConfig(), mem)
+
+	ref := testRef(1)
+	key, err := BuildIdempotencyKey(ref.TaskID, ref.StepNo, ref.CallIndex, testTool, json.RawMessage(testArgs))
+	if err != nil {
+		t.Fatalf("生成 key 失败: %v", err)
+	}
+	// 造一条"已获批、等执行"的记录（模拟恢复前的状态）
+	mem.rows[key] = &store.ToolCall{
+		IdemKey: key, TaskID: testTask, StepNo: 1, CallIndex: 1,
+		ToolName: testTool, Args: testArgs, Tier: int8(tools.TierHarmless),
+		Status: store.ToolCallStatusWaitingApproval, StartedAt: time.Now().UTC(),
+	}
+
+	tool := &countingTool{spec: testSpec(testTool), delay: 40 * time.Millisecond}
+	ctx := WithApprovalGranted(context.Background())
+
+	// 两个执行者同时开工
+	start := make(chan struct{})
+	outcomes := make(chan Outcome, 2)
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			outcomes <- pe.Run(ctx, tool, json.RawMessage(testArgs), ref)
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(outcomes)
+
+	var ok, inProgress int
+	for out := range outcomes {
+		switch {
+		case out.OK():
+			ok++
+		case out.InProgress:
+			inProgress++
+			if !errors.Is(out.Error, ErrCallInProgress) {
+				t.Errorf("处理中的错误应是 ErrCallInProgress，实际 %v", out.Error)
+			}
+		default:
+			t.Errorf("意外的结果: err=%v class=%s", out.Error, out.Class)
+		}
+	}
+
+	if tool.calls != 1 {
+		t.Errorf("下游应只被执行 1 次，实际 %d 次", tool.calls)
+	}
+	if ok != 1 || inProgress != 1 {
+		t.Errorf("应恰好 1 个成功 + 1 个处理中，实际 ok=%d inProgress=%d", ok, inProgress)
+	}
+	if mem.claimCalls != 2 {
+		t.Errorf("两个执行者都应尝试抢锁，实际 Claim 调用 %d 次", mem.claimCalls)
+	}
+}
+
+// 租约过期 = 原执行者已经崩了，允许别人接手。
+func TestClaimReclaimsExpiredLease(t *testing.T) {
+	mem := newMemStore()
+	pe, _ := persistedTestExecutor(fastConfig(), mem)
+
+	ref := testRef(1)
+	key, _ := BuildIdempotencyKey(ref.TaskID, ref.StepNo, ref.CallIndex, testTool, json.RawMessage(testArgs))
+	expired := time.Now().UTC().Add(-time.Minute)
+	mem.rows[key] = &store.ToolCall{
+		IdemKey: key, TaskID: testTask, StepNo: 1, CallIndex: 1,
+		ToolName: testTool, Args: testArgs, Tier: int8(tools.TierHarmless),
+		Status: store.ToolCallStatusExecuting, StartedAt: expired,
+		ClaimOwner: ptr("crashed-host:1:abcd"), ClaimExpiresAt: &expired, Attempt: 1,
+	}
+
+	tool := &countingTool{spec: testSpec(testTool)}
+	out := pe.Run(context.Background(), tool, json.RawMessage(testArgs), ref)
+	if !out.OK() {
+		t.Fatalf("租约过期后应允许接手执行: %v", out.Error)
+	}
+	if tool.calls != 1 {
+		t.Errorf("应执行 1 次，实际 %d", tool.calls)
+	}
+	if mem.rows[key].Attempt != 2 {
+		t.Errorf("attempt 应递增到 2，实际 %d", mem.rows[key].Attempt)
+	}
+}
+
+// 租约未过期 = 别人正在执行，绝不能重复执行。
+func TestClaimRespectsActiveLease(t *testing.T) {
+	mem := newMemStore()
+	pe, _ := persistedTestExecutor(fastConfig(), mem)
+
+	ref := testRef(1)
+	key, _ := BuildIdempotencyKey(ref.TaskID, ref.StepNo, ref.CallIndex, testTool, json.RawMessage(testArgs))
+	future := time.Now().UTC().Add(time.Minute)
+	mem.rows[key] = &store.ToolCall{
+		IdemKey: key, TaskID: testTask, StepNo: 1, CallIndex: 1,
+		ToolName: testTool, Args: testArgs, Tier: int8(tools.TierHarmless),
+		Status: store.ToolCallStatusExecuting, StartedAt: time.Now().UTC(),
+		ClaimOwner: ptr("alive-host:2:efgh"), ClaimExpiresAt: &future, Attempt: 1,
+	}
+
+	tool := &countingTool{spec: testSpec(testTool)}
+	out := pe.Run(context.Background(), tool, json.RawMessage(testArgs), ref)
+	if !out.InProgress {
+		t.Fatalf("租约未过期时应返回处理中，实际 ok=%v err=%v", out.OK(), out.Error)
+	}
+	if tool.calls != 0 {
+		t.Errorf("绝不能重复执行，实际执行 %d 次", tool.calls)
+	}
+}
+
+// 执行结束后必须释放租约，否则这一行会一直显示"有人在执行"。
+func TestClaimReleasedAfterExecution(t *testing.T) {
+	mem := newMemStore()
+	pe, _ := persistedTestExecutor(fastConfig(), mem)
+	tool := &countingTool{spec: testSpec(testTool)}
+
+	if out := pe.Run(context.Background(), tool, json.RawMessage(testArgs), testRef(1)); !out.OK() {
+		t.Fatalf("执行失败: %v", out.Error)
+	}
+	row := mem.rows[out0Key(t, testRef(1))]
+	if row.ClaimOwner != nil || row.ClaimExpiresAt != nil {
+		t.Errorf("执行结束应释放租约，实际 owner=%v expires=%v", row.ClaimOwner, row.ClaimExpiresAt)
+	}
+}
+
+func ptr(s string) *string { return &s }
+
+func out0Key(t *testing.T, ref CallRef) string {
+	t.Helper()
+	key, err := BuildIdempotencyKey(ref.TaskID, ref.StepNo, ref.CallIndex, testTool, json.RawMessage(testArgs))
+	if err != nil {
+		t.Fatalf("生成 key 失败: %v", err)
+	}
+	return key
 }

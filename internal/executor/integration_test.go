@@ -235,3 +235,96 @@ func TestRealMySQLThreePhaseAndReplay(t *testing.T) {
 		t.Errorf("任务删除后 tool_calls 应级联清空，实际还剩 %d 行", len(remaining))
 	}
 }
+
+// TestRealMySQLClaimCAS 在真实 MySQL 上验证执行租约：
+// 同一逻辑调用只能被抢到一次；租约过期后才允许别人接手；执行结束释放租约。
+//
+// 这是幂等 key 挡不住的那一类重复：两边都还没成功，只能靠 CAS 决定"谁执行"。
+func TestRealMySQLClaimCAS(t *testing.T) {
+	dsn := os.Getenv("SAFEGUARD_TEST_DB_DSN")
+	if dsn == "" {
+		t.Skip("未设置 SAFEGUARD_TEST_DB_DSN，跳过真实数据库集成测试")
+	}
+
+	ctx := context.Background()
+	st, err := store.Open(ctx, store.Config{DSN: dsn})
+	if err != nil {
+		t.Fatalf("连接数据库失败: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	taskRepo := store.NewTaskRepo(st.GORM())
+	taskID := fmt.Sprintf("task_it_claim_%d", time.Now().UnixNano())
+	now := time.Now().UTC()
+	if err := taskRepo.Create(ctx, &store.Task{
+		TaskID: taskID, UserQuery: "集成测试：执行租约", Status: store.TaskStatusRunning,
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("创建任务失败: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = st.GORM().Where("task_id = ?", taskID).Delete(&store.Task{}).Error
+	})
+
+	repo := store.NewToolCallRepo(st.GORM())
+	key := "cccccccccccccccccccccccccccccccc"
+	if _, _, err := repo.BeginIntent(ctx, &store.ToolCall{
+		IdemKey: key, TaskID: taskID, StepNo: 1, CallIndex: 1,
+		ToolName: "restart_service", Args: `{}`, Tier: 2,
+		Status: store.ToolCallStatusStarted, StartedAt: now,
+	}); err != nil {
+		t.Fatalf("写意图失败: %v", err)
+	}
+
+	// ① 第一个执行者抢到
+	ok, err := repo.Claim(ctx, key, "owner-a", time.Minute, false)
+	if err != nil || !ok {
+		t.Fatalf("第一次抢锁应成功: ok=%v err=%v", ok, err)
+	}
+
+	// ② 第二个执行者抢不到（租约还没过期）
+	ok, err = repo.Claim(ctx, key, "owner-b", time.Minute, false)
+	if err != nil {
+		t.Fatalf("第二次抢锁返回错误: %v", err)
+	}
+	if ok {
+		t.Fatal("租约未过期时不应被别人抢到——这正是并发保护的意义")
+	}
+
+	// ③ 模拟原执行者崩溃：租约过期后允许重抢
+	past := time.Now().UTC().Add(-time.Minute)
+	if err := st.GORM().Exec("UPDATE tool_calls SET claim_expires_at = ? WHERE idem_key = ?", past, key).Error; err != nil {
+		t.Fatalf("模拟租约过期失败: %v", err)
+	}
+	ok, err = repo.Claim(ctx, key, "owner-b", time.Minute, false)
+	if err != nil || !ok {
+		t.Fatalf("租约过期后应可接管: ok=%v err=%v", ok, err)
+	}
+
+	row, err := repo.Get(ctx, key)
+	if err != nil {
+		t.Fatalf("读取记录失败: %v", err)
+	}
+	if row.Attempt != 2 {
+		t.Errorf("attempt 应为 2（被抢两次），实际 %d", row.Attempt)
+	}
+	if row.ClaimOwner == nil || *row.ClaimOwner != "owner-b" {
+		t.Errorf("当前执行者应为 owner-b，实际 %v", row.ClaimOwner)
+	}
+
+	// ④ 执行结束：记录结果并释放租约
+	finished := time.Now().UTC()
+	if err := repo.RecordResult(ctx, key, store.ToolCallResult{
+		Status: store.ToolCallStatusSuccess, FinishedAt: finished,
+	}); err != nil {
+		t.Fatalf("回写结果失败: %v", err)
+	}
+	row, err = repo.Get(ctx, key)
+	if err != nil {
+		t.Fatalf("读取记录失败: %v", err)
+	}
+	if row.ClaimOwner != nil || row.ClaimExpiresAt != nil {
+		t.Errorf("执行结束应释放租约，实际 owner=%v expires=%v", row.ClaimOwner, row.ClaimExpiresAt)
+	}
+	t.Logf("CAS 语义验证：抢锁 → 拒绝并发 → 过期接管 → 结束释放（attempt=%d）", row.Attempt)
+}
