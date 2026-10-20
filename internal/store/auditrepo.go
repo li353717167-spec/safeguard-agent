@@ -28,6 +28,8 @@ const (
 	AuditApprovalDecided = "approval.decided"
 	// AuditTaskResumed 是从断点恢复任务。
 	AuditTaskResumed = "task.resumed"
+	// AuditInjectionFiltered 表示工具返回内容里含可疑指令、已被过滤。
+	AuditInjectionFiltered = "tool.injection_filtered"
 )
 
 // 审计主体（actor 列的取值前缀）。

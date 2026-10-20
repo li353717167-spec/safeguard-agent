@@ -56,6 +56,46 @@ type ToolCallResult struct {
 	FinishedAt time.Time
 }
 
+// Claim 抢占一次调用的执行权（乐观 CAS + 租约）。
+//
+// 允许抢的状态只有三种：
+//   - started：意图已落库但还没人抢（首次执行，或进程崩在中间）；
+//   - waiting_approval：**且调用方持有审批放行信号**（allowApproval=true）时才允许；
+//   - executing：且租约已过期（原执行者崩了，允许别人接手）。
+//
+// 返回 claimed=false 表示"没抢到"：要么别人正在执行，要么状态已经变成终态（success 等）。
+// 调用方在 false 时**必须不要执行**，并重新读一次状态决定是回放还是返回"处理中"。
+//
+// 为什么用一条 UPDATE 而不是先查后改：查和改之间就是竞态窗口，
+// 并发保护的全部意义就在把这两步压成一次原子操作。
+func (r *ToolCallRepo) Claim(ctx context.Context, idemKey, owner string, lease time.Duration, allowApproval bool) (bool, error) {
+	now := time.Now().UTC()
+	expires := now.Add(lease)
+
+	res := r.db.WithContext(ctx).Exec(`
+UPDATE tool_calls
+   SET status = 'executing',
+       claim_owner = ?,
+       claim_expires_at = ?,
+       attempt = attempt + 1
+ WHERE idem_key = ?
+   AND ( status = 'started'
+      OR ( status = 'waiting_approval' AND ? = 1 )
+      OR ( status = 'executing' AND (claim_expires_at IS NULL OR claim_expires_at < ?) ) )`,
+		owner, expires, idemKey, boolToInt(allowApproval), now)
+	if res.Error != nil {
+		return false, fmt.Errorf("store: 抢占执行权失败: %w", res.Error)
+	}
+	return res.RowsAffected > 0, nil
+}
+
+func boolToInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
 // RecordResult 回写执行结果（第三段）。
 //
 // 用 map 而不是 struct 更新：GORM 对 **struct** 会跳过零值字段，
@@ -68,6 +108,9 @@ func (r *ToolCallRepo) RecordResult(ctx context.Context, idemKey string, res Too
 		"err_message": res.ErrMessage,
 		"retry_count": res.RetryCount,
 		"finished_at": res.FinishedAt,
+		// 执行结束就释放租约：否则这一行会一直显示"有人在执行"。
+		"claim_owner":      nil,
+		"claim_expires_at": nil,
 	}
 	tx := r.db.WithContext(ctx).
 		Model(&ToolCall{}).

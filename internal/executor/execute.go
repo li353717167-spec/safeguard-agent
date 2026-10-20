@@ -79,6 +79,9 @@ type Outcome struct {
 	IdemKey string
 	// Replayed 表示这次没有真的打下游，而是回放了此前已成功的结果（幂等命中的标志）。
 	Replayed bool
+	// InProgress 表示这次调用正由另一个执行者处理（没抢到执行权）。
+	// 它不是故障也不是参数问题：调用方该做的不是重试，而是稍后再查结果。
+	InProgress bool
 }
 
 // OK 表示执行成功。

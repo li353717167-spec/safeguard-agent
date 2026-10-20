@@ -2,8 +2,12 @@ package executor
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/mechrevo/safeguard-agent/internal/store"
@@ -21,7 +25,11 @@ type CallRef struct {
 // 接口定义在消费方：测试塞一个内存实现即可，不需要数据库。
 type ToolCallStore interface {
 	BeginIntent(ctx context.Context, tc *store.ToolCall) (*store.ToolCall, bool, error)
+	// Claim 抢占执行权（CAS + 租约）。返回 false 表示没抢到：别人正在执行，或已是终态。
+	Claim(ctx context.Context, idemKey, owner string, lease time.Duration, allowApproval bool) (bool, error)
 	RecordResult(ctx context.Context, idemKey string, res store.ToolCallResult) error
+	// Get 用于"没抢到时"重新读状态，判断是回放还是返回处理中。
+	Get(ctx context.Context, idemKey string) (store.ToolCall, error)
 }
 
 // PersistedExecutor = Executor + 三段式落库 + 回放。
@@ -37,6 +45,12 @@ type PersistedExecutor struct {
 	exec  *Executor
 	store ToolCallStore
 	now   func() time.Time
+
+	// Owner 标识"谁在执行"，写进 tool_calls.claim_owner，便于排障时看出是谁抢到的。
+	Owner string
+	// Lease 是执行租约：必须**显著长于**最长执行时间（工具超时 × 尝试次数 + 余量），
+	// 否则正在正常执行的操作会被别人当成"进程崩了"重抢，导致重复执行。
+	Lease time.Duration
 }
 
 // NewPersisted 构造带落库的执行器。
@@ -44,8 +58,40 @@ func NewPersisted(exec *Executor, st ToolCallStore) *PersistedExecutor {
 	if exec == nil {
 		exec = New(DefaultConfig())
 	}
-	return &PersistedExecutor{exec: exec, store: st, now: func() time.Time { return time.Now().UTC() }}
+	return &PersistedExecutor{
+		exec:  exec,
+		store: st,
+		now:   func() time.Time { return time.Now().UTC() },
+		Owner: defaultOwner(),
+		Lease: DefaultLease,
+	}
 }
+
+// DefaultLease 是默认执行租约。
+//
+// 取值依据：最长执行时间 ≈ 工具超时（默认 10s）× 尝试次数（≤3）≈ 30s，
+// 留 4 倍余量到 2 分钟。租约太短会把"执行得慢"误判成"进程崩了"，导致重抢 + 重复执行。
+const DefaultLease = 2 * time.Minute
+
+// defaultOwner 生成进程级执行者标识：host:pid:随机。
+// 随机后缀是为了区分"同一台机器上重启前后的两个进程"。
+func defaultOwner() string {
+	host, err := os.Hostname()
+	if err != nil || host == "" {
+		host = "unknown"
+	}
+	buf := make([]byte, 4)
+	if _, err := rand.Read(buf); err != nil {
+		return fmt.Sprintf("%s:%d", host, os.Getpid())
+	}
+	return fmt.Sprintf("%s:%d:%s", host, os.Getpid(), hex.EncodeToString(buf))
+}
+
+// ErrCallInProgress 表示这次调用正被另一个执行者处理。
+//
+// 它不是下游故障、也不是参数错误：调用方**不应该重试**（重试会继续撞墙），
+// 而应该稍后再查结果。所以它单独成一个错误，编排层据此回喂"处理中，不要重复发起"。
+var ErrCallInProgress = errors.New("executor: 该调用正在由其他执行者处理")
 
 // Executor 暴露内部执行器（熔断状态查询、测试注入）。
 func (p *PersistedExecutor) Executor() *Executor { return p.exec }
@@ -84,13 +130,7 @@ func (p *PersistedExecutor) Run(ctx context.Context, tool tools.Tool, rawArgs js
 		case store.ToolCallStatusSuccess:
 			// 已经成功过：直接回放上次结果，不再打下游。
 			// 这就是"同一个逻辑操作重试两次，下游只被真实执行一次"。
-			return Outcome{
-				Result: tools.Result{
-					Data:    decodeStoredResult(existing.Result),
-					Summary: fmt.Sprintf("%s（回放：该操作此前已成功执行）", spec.Name),
-				},
-				Class: ClassOK, IdemKey: key, Replayed: true,
-			}
+			return p.replayOutcome(key, spec, existing.Result)
 
 		case store.ToolCallStatusWaitingApproval:
 			// 这次调用此前被挂起等审批。**只有拿到"已获批"的信号才允许执行**——
@@ -111,7 +151,24 @@ func (p *PersistedExecutor) Run(ctx context.Context, tool tools.Tool, rawArgs js
 		}
 	}
 
-	// ② 调下游。
+	// ② 抢执行权（CAS + 租约）。
+	//
+	// 幂等 key 只能挡住"**已完成的**重复"，挡不住"**同时在飞的**重复"：
+	// 两个进程同时恢复同一步，都读到 waiting_approval、都没看到 success，于是都会执行。
+	// 这一步把"读状态"和"开始执行"压成一次原子 UPDATE，只有抢到的那个才许往下走。
+	claimed, err := p.store.Claim(ctx, key, p.Owner, p.Lease, ApprovalGranted(ctx))
+	if err != nil {
+		return Outcome{Error: err, Class: ClassFatal, IdemKey: key}
+	}
+	if !claimed {
+		// 没抢到：可能是别人正在执行，也可能刚刚变成了 success（回放）。
+		if row, getErr := p.store.Get(ctx, key); getErr == nil && row.Status == store.ToolCallStatusSuccess {
+			return p.replayOutcome(key, spec, row.Result)
+		}
+		return Outcome{Error: ErrCallInProgress, Class: ClassFatal, InProgress: true, IdemKey: key}
+	}
+
+	// ③ 调下游。
 	//
 	// 把幂等 key 注入 ctx 再交给工具：这是"双保险"的第二半——
 	// 本地状态表挡住"这一次不许再发"，下游凭同一个 key 挡住"真被重复发了"。
@@ -121,7 +178,7 @@ func (p *PersistedExecutor) Run(ctx context.Context, tool tools.Tool, rawArgs js
 	out := p.exec.Execute(execCtx, tool, rawArgs)
 	out.IdemKey = key
 
-	// ③ 写结果
+	// ④ 写结果
 	res := store.ToolCallResult{
 		Status:     store.ToolCallStatusSuccess,
 		RetryCount: retryCount(out),
@@ -154,6 +211,17 @@ func (p *PersistedExecutor) Run(ctx context.Context, tool tools.Tool, rawArgs js
 }
 
 // retryCount 返回"重试了几次"（不含首次）。
+// replayOutcome 用库里存的上次结果构造回放结果（不打下游）。
+func (p *PersistedExecutor) replayOutcome(key string, spec tools.Spec, stored *string) Outcome {
+	return Outcome{
+		Result: tools.Result{
+			Data:    decodeStoredResult(stored),
+			Summary: fmt.Sprintf("%s（回放：该操作此前已成功执行）", spec.Name),
+		},
+		Class: ClassOK, IdemKey: key, Replayed: true,
+	}
+}
+
 func retryCount(out Outcome) int {
 	if n := len(out.Attempts) - 1; n > 0 {
 		return n

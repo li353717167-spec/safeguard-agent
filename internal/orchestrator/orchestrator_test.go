@@ -116,6 +116,8 @@ func (s *fakeState) lastStatus() string {
 type stubSource struct {
 	metric    tools.MetricSummary
 	metricErr error
+	// configs 非空时用它：用来构造"被污染的数据源"（间接提示注入）。
+	configs []tools.ConfigItem
 }
 
 func (s stubSource) ListServices(context.Context) ([]tools.ServiceInfo, error) {
@@ -130,6 +132,9 @@ func (s stubSource) QueryMetrics(context.Context, string, string, time.Duration)
 }
 
 func (s stubSource) QueryConfig(context.Context, string) ([]tools.ConfigItem, error) {
+	if len(s.configs) > 0 {
+		return s.configs, nil
+	}
 	return []tools.ConfigItem{{Key: "timeout_ms", Value: "800"}}, nil
 }
 
