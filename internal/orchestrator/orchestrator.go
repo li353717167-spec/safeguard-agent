@@ -117,6 +117,8 @@ type Result struct {
 	ToolCalls int
 	Traces    []ToolTrace
 	Usage     llm.Usage
+	// Context 是最近一次上下文压缩的结果（估算 token、裁剪与折叠数量）。
+	Context ContextStats
 	// Ticket 是挂起时生成的审批工单（Stop==StopWaitingApproval 时非空）。
 	Ticket *store.Approval
 }
@@ -167,6 +169,8 @@ type Options struct {
 	Gate *approval.Gate
 	// Auditor 是审计写入。留空则不记审计（评测与单测用）。
 	Auditor Auditor
+	// Budget 是上下文预算（发送前裁剪工具结果、折叠早期轮次）。零值用默认。
+	Budget  ContextBudget
 	OnEvent func(Event)
 	now     func() time.Time
 }
@@ -180,6 +184,7 @@ type Orchestrator struct {
 	policy   *policy.Engine
 	gate     *approval.Gate
 	auditor  Auditor
+	budget   ContextBudget
 	opts     Options
 }
 
@@ -202,7 +207,8 @@ func New(client llm.Client, registry *tools.Registry, state StateStore, opts Opt
 	}
 	return &Orchestrator{
 		client: client, registry: registry, state: state,
-		runner: opts.Runner, policy: opts.Policy, gate: opts.Gate, auditor: opts.Auditor, opts: opts,
+		runner: opts.Runner, policy: opts.Policy, gate: opts.Gate, auditor: opts.Auditor,
+		budget: opts.Budget.normalized(), opts: opts,
 	}
 }
 
@@ -214,6 +220,13 @@ type run struct {
 	guard    *loopGuard
 	res      Result
 	messages []llm.Message
+	// 上下文压缩相关：basePinned 是"永不折叠"的前缀（system + 用户原始问题），
+	// summary 是折叠出来的进展摘要，foldedCalls 是已经摘要进 summary 的调用条数。
+	basePinned  int
+	summary     string
+	foldedCalls int
+	stats       ContextStats
+
 	// parked 非空表示这次运行因审批挂起。
 	// 挂起是"流程结束"信号，用字段传递，避免把 handleToolCall 的返回值搞成五元组。
 	parked *store.Approval
@@ -379,6 +392,9 @@ func (o *Orchestrator) run(ctx context.Context, query string, resume *resumeStat
 		messages: o.initialMessages(query),
 	}
 
+	// 前缀（system + 用户原始问题）永不折叠；恢复时的前缀长度与普通运行一致。
+	r.basePinned = len(o.initialMessages(query))
+
 	if resume != nil {
 		// 恢复：复用已有消息历史与预算计数，并把任务状态改回 running。
 		r.messages = resume.messages
@@ -424,6 +440,9 @@ func (o *Orchestrator) run(ctx context.Context, query string, resume *resumeStat
 			return r.finishWithSummary(ctx, StopMaxRounds)
 		}
 		round := r.guard.startRound() // 先加轮次
+
+		// 发之前先压缩：超预算就裁剪工具结果、折叠早期整轮。
+		r.compactContext(round)
 
 		// 工具 schema 每轮都注入：这是 ReAct 的"手"。
 		resp, err := r.chat(ctx, o.registry.Schemas())
@@ -902,6 +921,9 @@ func (r *run) finishWithSummary(ctx context.Context, reason StopReason) (Result,
 		"请基于目前已获得的信息，用简洁的中文总结：已知的事实、仍未确认的部分、以及建议的下一步。" +
 		"不要编造未获得的数据。"
 
+	// 总结这次调用同样要过预算：它往往发生在工具调用最多、上下文最大的时刻。
+	r.compactContext(r.res.Rounds)
+
 	// 用完整切片表达式做一份浅拷贝，避免 append 改到底层数组污染历史消息。
 	msgs := r.messages[:len(r.messages):len(r.messages)]
 	msgs = append(msgs, llm.Message{Role: llm.RoleUser, Content: instruction})
@@ -947,6 +969,7 @@ func (r *run) markFailed(ctx context.Context) {
 }
 
 func (r *run) syncCounts() {
+	r.res.Context = r.stats
 	r.res.Rounds, r.res.ToolCalls = r.guard.uses()
 }
 

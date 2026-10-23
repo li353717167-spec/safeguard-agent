@@ -101,7 +101,7 @@ go run ./cmd/agent -resume task_xxxxxxxx            # 从断点续跑（用原�
 
 ---
 
-## 七个关键机制
+## 八个关键机制
 
 ### 1）失败要分类，重试要克制
 
@@ -195,6 +195,32 @@ UPDATE tool_calls SET status='executing', claim_owner=?, claim_expires_at=?, att
 | 权限不依赖文本 | 即使前两层被绕过，高危操作照样要审批 |
 
 > 代码：`internal/safety/safety.go`、`orchestrator.go` 成功路径的 `SanitizeAny` + `MarkToolOutput`
+
+### 8）上下文预算：轮次上限管次数，预算管体积
+
+8 轮上限不约束体积：一个 `query_metrics` 返回 500 个采样点，两轮就能把窗口撑满。
+上下文一满，失败不是报错，而是模型**开始遗忘最早的要求**、答非所问。
+
+三级策略，代价从低到高：
+
+| 级别 | 做法 | 触发条件 |
+|---|---|---|
+| 裁剪 | 单条工具结果超 `MaxToolResultBytes` → 换成合法 JSON 的「预览 + 原文已落库」 | 每次都检查 |
+| 折叠 | 把最早**整轮**（assistant + 它的 tool 结果）换成一条进展摘要 | 估算超 `MaxTokens` |
+| 告警 | 还不够就照发并打印告警 | 折叠到只剩最近 N 轮 |
+
+折叠必须**整轮**删除：只删 tool 结果会留下"有 tool_calls 却没有结果"的残缺，端点会直接拒绝请求。
+估算不做分词（那要几 MB 依赖）：ASCII 约 4 字节 1 token、中文约 1 字 1 token，偏保守。
+
+```bash
+SAFEGUARD_CONTEXT_MAX_TOKENS=6000      # 估算上限
+SAFEGUARD_CONTEXT_KEEP_ROUNDS=2        # 最近几轮永不折叠
+SAFEGUARD_CONTEXT_MAX_TOOL_BYTES=2000  # 单条工具结果上限
+```
+
+运行时能看到：`[轮次 3] 上下文估算 6120/6000 tokens（裁剪 2 条工具结果、折叠 2 轮）`。
+
+> 代码：`internal/orchestrator/budget.go`（`EstimateTokens` / `trimToolContent` / `compactMessages`）
 
 ---
 
