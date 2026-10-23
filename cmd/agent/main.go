@@ -672,7 +672,12 @@ func runResume(ctx context.Context, cfg config.Config, taskID string, timeoutOve
 		Policy:      policy.New(),
 		Gate:        gate,
 		Auditor:     store.NewAuditRepo(st.GORM()),
-		OnEvent:     printOrchestratorEvent,
+		Budget: orchestrator.ContextBudget{
+			MaxTokens:          cfg.Context.MaxTokens,
+			KeepRecentRounds:   cfg.Context.KeepRecentRounds,
+			MaxToolResultBytes: cfg.Context.MaxToolResultBytes,
+		},
+		OnEvent: printOrchestratorEvent,
 	})
 
 	fmt.Printf("--- 从断点恢复 %s ---\n", taskID)
@@ -754,6 +759,12 @@ func runAsk(ctx context.Context, cfg config.Config, question string, timeoutOver
 		Policy:  policy.New(),
 		Gate:    approval.NewGate(toolCalls, store.NewApprovalRepo(st.GORM())),
 		Auditor: store.NewAuditRepo(st.GORM()),
+		// 上下文预算：超了先裁剪工具结果，再折叠早期整轮。
+		Budget: orchestrator.ContextBudget{
+			MaxTokens:          cfg.Context.MaxTokens,
+			KeepRecentRounds:   cfg.Context.KeepRecentRounds,
+			MaxToolResultBytes: cfg.Context.MaxToolResultBytes,
+		},
 		OnEvent: printOrchestratorEvent,
 	})
 
@@ -779,6 +790,10 @@ func runAsk(ctx context.Context, cfg config.Config, question string, timeoutOver
 	fmt.Println("--- 运行信息 ---")
 	fmt.Printf("task_id=%s 停止原因=%s 轮次=%d 工具调用=%d 上限触发=%v\n",
 		res.TaskID, res.Stop, res.Rounds, res.ToolCalls, res.LimitTriggered())
+	if res.Context.Budget > 0 {
+		fmt.Printf("上下文: 估算 %d/%d tokens（裁剪 %d 条工具结果、折叠 %d 轮）\n",
+			res.Context.Tokens, res.Context.Budget, res.Context.Trimmed, res.Context.FoldedRounds)
+	}
 	fmt.Printf("tokens: prompt=%d completion=%d total=%d\n",
 		res.Usage.PromptTokens, res.Usage.CompletionTokens, res.Usage.TotalTokens)
 	return exitOK
@@ -834,6 +849,8 @@ func printOrchestratorEvent(ev orchestrator.Event) {
 		if ev.Trace.Error != "" {
 			fmt.Printf("          错误：%s\n", truncateRunes(ev.Trace.Error, 160))
 		}
+	case "context":
+		fmt.Printf("[轮次 %d] %s\n", ev.Round, ev.Text)
 	case "limit":
 		fmt.Printf("[轮次 %d] 已达上限：%s\n", ev.Round, ev.Text)
 	}

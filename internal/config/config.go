@@ -22,6 +22,7 @@ const envPrefix = "SAFEGUARD_"
 type Config struct {
 	LLM      LLM
 	DB       DB
+	Context  Context
 	LogLevel string
 }
 
@@ -31,6 +32,16 @@ type LLM struct {
 	APIKey  string
 	Model   string
 	Timeout time.Duration
+}
+
+// Context 是上下文预算配置（发给模型的内容体积）。
+type Context struct {
+	// MaxTokens 是估算上限：超了先裁剪工具结果、再折叠早期轮次。
+	MaxTokens int
+	// KeepRecentRounds 是永不折叠的最近轮数。
+	KeepRecentRounds int
+	// MaxToolResultBytes 是单条工具结果保留的最大字节数。
+	MaxToolResultBytes int
 }
 
 // DB 是数据库侧配置。
@@ -59,6 +70,18 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	ctxTokens, err := intEnv("CONTEXT_MAX_TOKENS", 6000)
+	if err != nil {
+		return Config{}, err
+	}
+	ctxKeep, err := intEnv("CONTEXT_KEEP_ROUNDS", 2)
+	if err != nil {
+		return Config{}, err
+	}
+	ctxToolBytes, err := intEnv("CONTEXT_MAX_TOOL_BYTES", 2000)
+	if err != nil {
+		return Config{}, err
+	}
 
 	return Config{
 		LLM: LLM{
@@ -72,6 +95,11 @@ func Load() (Config, error) {
 			MaxOpenConns:    maxOpen,
 			MaxIdleConns:    maxIdle,
 			ConnMaxLifetime: connLife,
+		},
+		Context: Context{
+			MaxTokens:          ctxTokens,
+			KeepRecentRounds:   ctxKeep,
+			MaxToolResultBytes: ctxToolBytes,
 		},
 		LogLevel: stringEnv("LOG_LEVEL", "info"),
 	}, nil
