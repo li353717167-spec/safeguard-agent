@@ -20,6 +20,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"os/signal"
 	"sort"
@@ -66,6 +67,8 @@ func realMain(args []string) int {
 	rejectReason := fs.String("reason", "", "配合 -reject：拒绝理由（会被回喂给模型）")
 	resumeID := fs.String("resume", "", "从断点恢复指定任务（task_...）并继续执行")
 	auditArg := fs.String("audit", "", "查看审计：传 task_... 看该任务，传 all 看最近 20 条")
+	models := fs.Bool("models", false, "查看模型端点健康状态（配置了 SAFEGUARD_LLM_FALLBACKS 时才有多个）")
+	probe := fs.Bool("probe", false, "配合 -models：对每个端点发一次最小请求，主动探测稳定性")
 	evalCases := fs.String("eval", "", "跑评测：指定评测集 JSON 路径（如 internal/eval/cases.json）")
 	evalModel := fs.String("eval-model", "fake", "评测用模型：fake（理想模型，验证判分器）| broken（坏模型，验证判分能发现错误）| real（真实模型）")
 	evalOut := fs.String("eval-out", "", "把评测报告写成 Markdown 到指定路径")
@@ -87,6 +90,7 @@ func realMain(args []string) int {
 			"  safeguard-agent -reject <tk_...> -reason \"...\"\n"+
 			"  safeguard-agent -resume <task_...>\n"+
 			"  safeguard-agent -audit <task_...|all>\n"+
+			"  safeguard-agent -models [-probe]\n"+
 			"  safeguard-agent -eval internal/eval/cases.json -eval-model=fake\n"+
 			"  safeguard-agent -migrate\n"+
 			"  safeguard-agent -seed\n"+
@@ -141,6 +145,8 @@ func realMain(args []string) int {
 		return runResume(ctx, cfg, strings.TrimSpace(*resumeID), *timeout, *showRaw)
 	case strings.TrimSpace(*auditArg) != "":
 		return runAudit(ctx, cfg, strings.TrimSpace(*auditArg))
+	case *models:
+		return runModels(ctx, cfg, *probe)
 	case strings.TrimSpace(*evalCases) != "":
 		return runEval(ctx, cfg, strings.TrimSpace(*evalCases), *evalModel, *evalOut, *evalJudge, *timeout)
 	case *doMigrate:
@@ -319,11 +325,97 @@ func newLLMClient(cfg config.Config) (llm.Client, error) {
 	if err := cfg.LLM.Validate(); err != nil {
 		return nil, err
 	}
-	return llm.NewOpenAICompat(llm.OpenAICompatConfig{
+
+	primary, err := llm.NewOpenAICompat(llm.OpenAICompatConfig{
 		BaseURL: cfg.LLM.BaseURL,
 		APIKey:  cfg.LLM.APIKey,
 		Model:   cfg.LLM.Model,
 	})
+	if err != nil {
+		return nil, err
+	}
+
+	// 只有配了备用端点才包一层路由：单端点没有"切换"可言，不必多一层间接。
+	if len(cfg.LLM.Fallbacks) == 0 {
+		return primary, nil
+	}
+
+	endpoints := []llm.Endpoint{{
+		Name:   endpointName(cfg.LLM.BaseURL, cfg.LLM.Model),
+		Client: primary,
+	}}
+	for _, fb := range cfg.LLM.Fallbacks {
+		client, err := llm.NewOpenAICompat(llm.OpenAICompatConfig{
+			BaseURL: fb.BaseURL,
+			APIKey:  fb.APIKey,
+			Model:   fb.Model,
+		})
+		if err != nil {
+			return nil, err
+		}
+		endpoints = append(endpoints, llm.Endpoint{
+			Name:   endpointName(fb.BaseURL, fb.Model),
+			Client: client,
+		})
+	}
+
+	return llm.NewRouter(llm.RouterConfig{
+		Endpoints:     endpoints,
+		FailThreshold: cfg.LLM.FailThreshold,
+		Cooldown:      cfg.LLM.Cooldown,
+		OnFailover: func(from, to, reason string) {
+			slog.Warn("模型端点切换", "from", from, "to", to, "reason", truncateRunes(reason, 160))
+		},
+	})
+}
+
+// endpointName 给端点起一个可读名字（host/model），用于日志与 -models。
+func endpointName(baseURL, model string) string {
+	host := baseURL
+	if u, err := url.Parse(baseURL); err == nil && u.Host != "" {
+		host = u.Host
+	}
+	return host + "/" + model
+}
+
+// runModels 展示模型端点的健康状态；-probe 会主动发一次最小请求。
+//
+// 这条命令回答的是"现在该不该切"：谁在冷却、连续失败几次、窗口成功率、P95 延迟。
+// 注意它是**进程内**的观测：路由器状态活在内存里，进程退出即清零。
+func runModels(ctx context.Context, cfg config.Config, probe bool) int {
+	client, err := newLLMClient(cfg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "配置错误: %v\n", err)
+		return exitUsage
+	}
+
+	router, ok := client.(*llm.Router)
+	if !ok {
+		fmt.Printf("--- 单端点（未配置备用端点）---\n%s / %s\n", client.Provider(), client.Model())
+		if probe {
+			started := time.Now()
+			if _, err := client.Chat(ctx, llm.ChatRequest{Messages: []llm.Message{
+				{Role: llm.RoleUser, Content: "ping"},
+			}}); err != nil {
+				fmt.Printf("探测失败: %v\n", err)
+				return exitFailure
+			}
+			fmt.Printf("探测成功，耗时 %s\n", time.Since(started).Round(time.Millisecond))
+		}
+		return exitOK
+	}
+
+	statuses := router.Statuses()
+	if probe {
+		fmt.Println("--- 主动探测中（每个端点一次最小请求）---")
+		statuses = router.ProbeAll(ctx)
+	}
+	fmt.Println("--- 模型端点健康 ---")
+	fmt.Print(llm.DescribeStatuses(statuses))
+	if ctx.Err() != nil {
+		return exitFailure
+	}
+	return exitOK
 }
 
 // runApprovals 列出待审批工单。

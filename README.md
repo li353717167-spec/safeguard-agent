@@ -101,7 +101,7 @@ go run ./cmd/agent -resume task_xxxxxxxx            # 从断点续跑（用原�
 
 ---
 
-## 八个关键机制
+## 九个关键机制
 
 ### 1）失败要分类，重试要克制
 
@@ -222,6 +222,33 @@ SAFEGUARD_CONTEXT_MAX_TOOL_BYTES=2000  # 单条工具结果上限
 
 > 代码：`internal/orchestrator/budget.go`（`EstimateTokens` / `trimToolContent` / `compactMessages`）
 
+### 9）模型端点：监控稳定性 + 丝滑切换
+
+模型端点是整条链路里**最不可控**的依赖：它会 503、会超时、会限流。单端点一挂，Agent 整体就挂。
+
+```bash
+# 配了备用端点就自动启用路由；不配就是单端点
+SAFEGUARD_LLM_FALLBACKS="http://127.0.0.1:8081/v1|qwen2.5-7b|"
+```
+
+三个设计点：
+
+| 点 | 做法 | 为什么 |
+|---|---|---|
+| **切换在调用内部** | 某个端点失败，同一次 Chat 立刻用下一个端点重发 | 上层看到的是"一次成功"，用户无感 |
+| **粘性优先于轮询** | 切到某个端点后继续用它，直到它不健康 | 模型行为与 prompt 缓存都绑端点，同一任务来回换会让行为跳变 |
+| **全挂 fail-open** | 全部冷却时仍选"最早恢复"的去试 | 宁可多试一次，也不要让任务因"监控判定"直接失败 |
+
+健康判定：滑动窗口统计 + **连续失败 ≥ 3 次进入 30 秒冷却**；冷却到期放一次试探（半开），成功复位、失败重新冷却。
+**冷却到期即可试**——如果要求"连续失败先清零"，端点会永远无法恢复（没人调它，自然没有成功来清零）。
+
+```bash
+go run ./cmd/agent -models           # 看各端点：状态/连续失败/窗口成功率/P95/冷却剩余
+go run ./cmd/agent -models -probe    # 主动探测：每个端点发一次最小请求
+```
+
+> 代码：`internal/llm/router.go`（`Chat` / `candidates` / `Statuses` / `ProbeAll`）
+
 ---
 
 ## 怎么验证它真的对
@@ -267,7 +294,7 @@ go run ./cmd/agent -eval internal/eval/cases.json -eval-model=real    # 真实�
 ## 目录结构
 
 ```
-cmd/agent/                 # CLI：-ask / -approve / -reject / -resume / -audit / -eval / -tools / -migrate / -seed
+cmd/agent/                 # CLI：-ask / -approve / -reject / -resume / -audit / -models / -eval / -tools / -migrate / -seed
 internal/
 ├── approval/              # 审批门禁：先落库再挂起（意图 → 工单 → 结束运行）
 ├── config/                # 配置装载（环境变量 + .env，密钥只走环境变量）
@@ -325,7 +352,8 @@ docs/                      # 架构图 / 设计决策 / 代码走读 / 阅读指
 3. **评测集小**：11 道题只能证明框架跑通，不能当能力基准。
 4. **并发多调用未验证**：一次工具调用 = 一步，`call_index` 恒为 1，一轮多调用的并发路径没跑过。
 5. **审计只覆盖变更与拒绝**：只读调用没有审计记录（设计选择，见上）。
-6. **注入防御是规则匹配**：能挡住已知句式，挡不住精心改写过的注入。真正的保证是权限层与审计，
+6. **端点健康状态只在进程内**：不持久化、不跨实例共享；进程重启后回到首选端点（不自动回切是刻意的，避免抖动）。
+7. **注入防御是规则匹配**：能挡住已知句式，挡不住精心改写过的注入。真正的保证是权限层与审计，
    规则那一层只负责"降低成功率 + 留下痕迹"。
 
 ---
