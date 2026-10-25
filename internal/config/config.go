@@ -32,6 +32,54 @@ type LLM struct {
 	APIKey  string
 	Model   string
 	Timeout time.Duration
+
+	// Fallbacks 是备用端点，按顺序尝试。为空表示单端点（不启用路由）。
+	Fallbacks []EndpointConfig
+	// FailThreshold 是"连续失败多少次判定端点不健康"。
+	FailThreshold int
+	// Cooldown 是判定不健康后的冷却时间。
+	Cooldown time.Duration
+}
+
+// EndpointConfig 是一个备用端点。
+type EndpointConfig struct {
+	BaseURL string
+	Model   string
+	APIKey  string
+}
+
+// parseFallbacks 解析 SAFEGUARD_LLM_FALLBACKS。
+//
+// 格式：`base_url|model|api_key;base_url|model|api_key`（api_key 可省略）。
+// 用 `|` 分字段、`;` 分端点：URL 里本来就有 `:` 和 `/`，用它们当分隔符会很难读。
+func parseFallbacks(raw string) ([]EndpointConfig, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	var out []EndpointConfig
+	for _, part := range strings.Split(raw, ";") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		fields := strings.Split(part, "|")
+		if len(fields) < 2 {
+			return nil, fmt.Errorf("%sLLM_FALLBACKS 格式应为 base_url|model|api_key，实际 %q", envPrefix, part)
+		}
+		ep := EndpointConfig{
+			BaseURL: strings.TrimSpace(fields[0]),
+			Model:   strings.TrimSpace(fields[1]),
+		}
+		if len(fields) >= 3 {
+			ep.APIKey = strings.TrimSpace(fields[2])
+		}
+		if ep.BaseURL == "" || ep.Model == "" {
+			return nil, fmt.Errorf("%sLLM_FALLBACKS 的 base_url 与 model 都不能为空（%q）", envPrefix, part)
+		}
+		out = append(out, ep)
+	}
+	return out, nil
 }
 
 // Context 是上下文预算配置（发给模型的内容体积）。
@@ -82,13 +130,28 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	fallbacks, err := parseFallbacks(stringEnv("LLM_FALLBACKS", ""))
+	if err != nil {
+		return Config{}, err
+	}
+	failThreshold, err := intEnv("LLM_FAIL_THRESHOLD", 3)
+	if err != nil {
+		return Config{}, err
+	}
+	llmCooldown, err := durationEnv("LLM_COOLDOWN", 30*time.Second)
+	if err != nil {
+		return Config{}, err
+	}
 
 	return Config{
 		LLM: LLM{
-			BaseURL: stringEnv("LLM_BASE_URL", "https://api.deepseek.com/v1"),
-			APIKey:  strings.TrimSpace(os.Getenv(envPrefix + "LLM_API_KEY")),
-			Model:   stringEnv("LLM_MODEL", "deepseek-chat"),
-			Timeout: timeout,
+			BaseURL:       stringEnv("LLM_BASE_URL", "https://api.deepseek.com/v1"),
+			APIKey:        strings.TrimSpace(os.Getenv(envPrefix + "LLM_API_KEY")),
+			Model:         stringEnv("LLM_MODEL", "deepseek-chat"),
+			Timeout:       timeout,
+			Fallbacks:     fallbacks,
+			FailThreshold: failThreshold,
+			Cooldown:      llmCooldown,
 		},
 		DB: DB{
 			DSN:             strings.TrimSpace(os.Getenv(envPrefix + "DB_DSN")),
