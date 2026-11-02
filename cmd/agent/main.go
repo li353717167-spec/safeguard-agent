@@ -30,6 +30,7 @@ import (
 
 	"github.com/mechrevo/safeguard-agent/internal/approval"
 	"github.com/mechrevo/safeguard-agent/internal/config"
+	"github.com/mechrevo/safeguard-agent/internal/contextplan"
 	"github.com/mechrevo/safeguard-agent/internal/eval"
 	"github.com/mechrevo/safeguard-agent/internal/executor"
 	"github.com/mechrevo/safeguard-agent/internal/llm"
@@ -747,6 +748,16 @@ func runResume(ctx context.Context, cfg config.Config, taskID string, timeoutOve
 		slog.Error("注册内置工具失败（启动门禁）", "err", err)
 		return exitFailure
 	}
+	archiveRepo := store.NewContextArchiveRepo(st.GORM())
+	if err := reg.Register(tools.NewRecallContext(archiveAdapter{repo: archiveRepo})); err != nil {
+		slog.Error("注册 recall_context 失败", "err", err)
+		return exitFailure
+	}
+	strategy, err := newContextStrategy(cfg)
+	if err != nil {
+		slog.Error("压缩策略配置有误", "err", err)
+		return exitUsage
+	}
 
 	taskRepo := store.NewTaskRepo(st.GORM())
 	toolCalls := store.NewToolCallRepo(st.GORM())
@@ -769,7 +780,9 @@ func runResume(ctx context.Context, cfg config.Config, taskID string, timeoutOve
 			KeepRecentRounds:   cfg.Context.KeepRecentRounds,
 			MaxToolResultBytes: cfg.Context.MaxToolResultBytes,
 		},
-		OnEvent: printOrchestratorEvent,
+		Strategy: strategy,
+		Archive:  store.NewContextArchiveRepo(st.GORM()),
+		OnEvent:  printOrchestratorEvent,
 	})
 
 	fmt.Printf("--- 从断点恢复 %s ---\n", taskID)
@@ -827,6 +840,16 @@ func runAsk(ctx context.Context, cfg config.Config, question string, timeoutOver
 		slog.Error("注册内置工具失败（启动门禁）", "err", err)
 		return exitFailure
 	}
+	archiveRepo := store.NewContextArchiveRepo(st.GORM())
+	if err := reg.Register(tools.NewRecallContext(archiveAdapter{repo: archiveRepo})); err != nil {
+		slog.Error("注册 recall_context 失败", "err", err)
+		return exitFailure
+	}
+	strategy, err := newContextStrategy(cfg)
+	if err != nil {
+		slog.Error("压缩策略配置有误", "err", err)
+		return exitUsage
+	}
 
 	limits := orchestrator.DefaultLimits()
 	if maxRounds > 0 {
@@ -851,13 +874,15 @@ func runAsk(ctx context.Context, cfg config.Config, question string, timeoutOver
 		Policy:  policy.New(),
 		Gate:    approval.NewGate(toolCalls, store.NewApprovalRepo(st.GORM())),
 		Auditor: store.NewAuditRepo(st.GORM()),
-		// 上下文预算：超了先裁剪工具结果，再折叠早期整轮。
+		// 上下文预算 + 压缩策略：预算决定"多大算大"，策略决定"怎么压"。
 		Budget: orchestrator.ContextBudget{
 			MaxTokens:          cfg.Context.MaxTokens,
 			KeepRecentRounds:   cfg.Context.KeepRecentRounds,
 			MaxToolResultBytes: cfg.Context.MaxToolResultBytes,
 		},
-		OnEvent: printOrchestratorEvent,
+		Strategy: strategy,
+		Archive:  archiveRepo,
+		OnEvent:  printOrchestratorEvent,
 	})
 
 	fmt.Printf("--- ReAct 循环开始（上限：轮次 %d / 工具调用 %d）---\n", limits.MaxRounds, limits.MaxToolCalls)
@@ -1096,4 +1121,73 @@ func truncateRunes(s string, max int) string {
 		return s
 	}
 	return string(r[:max]) + "…(已截断)"
+}
+
+// newContextStrategy 按配置构造压缩策略。
+//
+// 优先级：JSON 策略文件 > 环境变量 > 内置默认。
+// 策略文件让"换压缩策略"变成改配置，而不是改代码。
+func newContextStrategy(cfg config.Config) (contextplan.Strategy, error) {
+	planCfg := contextplan.Config{
+		Strategy:         cfg.Context.Strategy,
+		MaxTokens:        cfg.Context.MaxTokens,
+		KeepRecentRounds: cfg.Context.KeepRecentRounds,
+		MaxToolBytes:     cfg.Context.MaxToolResultBytes,
+	}
+	if cfg.Context.PolicyPath != "" {
+		loaded, err := contextplan.LoadConfig(cfg.Context.PolicyPath)
+		if err != nil {
+			return nil, err
+		}
+		if loaded.Strategy != "" {
+			planCfg.Strategy = loaded.Strategy
+		}
+		if loaded.MaxTokens > 0 {
+			planCfg.MaxTokens = loaded.MaxTokens
+		}
+		if loaded.KeepRecentRounds > 0 {
+			planCfg.KeepRecentRounds = loaded.KeepRecentRounds
+		}
+		if loaded.DetailRounds > 0 {
+			planCfg.DetailRounds = loaded.DetailRounds
+		}
+		if loaded.MaxToolBytes > 0 {
+			planCfg.MaxToolBytes = loaded.MaxToolBytes
+		}
+		planCfg.Dedupe = loaded.Dedupe
+		planCfg.KeepFailures = loaded.KeepFailures
+	}
+	return contextplan.New(planCfg.Strategy, planCfg)
+}
+
+// archiveAdapter 把 store 的归档仓储适配成工具需要的查询接口。
+type archiveAdapter struct {
+	repo *store.ContextArchiveRepo
+}
+
+func (a archiveAdapter) Get(ctx context.Context, taskID, ref string) (tools.ArchiveItem, bool, error) {
+	entry, ok, err := a.repo.Get(ctx, taskID, ref)
+	if err != nil || !ok {
+		return tools.ArchiveItem{}, ok, err
+	}
+	return toArchiveItem(entry), true, nil
+}
+
+func (a archiveAdapter) Search(ctx context.Context, taskID, query string, round, limit int) ([]tools.ArchiveItem, error) {
+	entries, err := a.repo.Search(ctx, taskID, query, round, limit)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]tools.ArchiveItem, 0, len(entries))
+	for _, e := range entries {
+		out = append(out, toArchiveItem(e))
+	}
+	return out, nil
+}
+
+func toArchiveItem(e store.ContextArchiveEntry) tools.ArchiveItem {
+	return tools.ArchiveItem{
+		Ref: e.Ref, Round: e.Round, Role: e.Role,
+		ToolName: e.ToolName, Content: e.Content, Tokens: e.Tokens,
+	}
 }

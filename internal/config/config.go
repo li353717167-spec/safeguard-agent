@@ -90,6 +90,10 @@ type Context struct {
 	KeepRecentRounds int
 	// MaxToolResultBytes 是单条工具结果保留的最大字节数。
 	MaxToolResultBytes int
+	// Strategy 是压缩策略名（trim-fold / tiered / none，或自定义注册名）。
+	Strategy string
+	// PolicyPath 是 JSON 策略文件路径（可选）：文件里的字段覆盖环境变量。
+	PolicyPath string
 }
 
 // DB 是数据库侧配置。
@@ -163,6 +167,8 @@ func Load() (Config, error) {
 			MaxTokens:          ctxTokens,
 			KeepRecentRounds:   ctxKeep,
 			MaxToolResultBytes: ctxToolBytes,
+			Strategy:           stringEnv("CONTEXT_STRATEGY", "tiered"),
+			PolicyPath:         stringEnv("CONTEXT_POLICY", ""),
 		},
 		LogLevel: stringEnv("LOG_LEVEL", "info"),
 	}, nil
