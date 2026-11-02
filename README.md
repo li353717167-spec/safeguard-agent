@@ -56,6 +56,12 @@ flowchart LR
 
 ---
 
+## 看它跑一遍
+
+![90 秒演示：工具分级 → 高危操作被拦下 → 人工审批 → 断点续跑 → 审计链路](docs/assets/demo.gif)
+
+> 演示用的是脚本模型（`cmd/fake-llm`），保证每次运行都一样；但**编排、权限判定、审批工单、幂等落库、审计与 MySQL 都是真的**——只有"模型说什么"是脚本。
+
 ## 迭代轨迹
 
 不是一次写完的，是按"能上生产"的顺序一块块补的。每一步都有测试与 `design.md` 决策记录，不是先堆功能再补文档。
@@ -392,7 +398,7 @@ docs/                      # 架构图 / 设计决策 / 代码走读 / 阅读指
 | [docs/design.md](docs/design.md) | 23 节设计决策记录，每条都写清"理由 / 代价"，附实测数据 |
 | [docs/code-walkthrough.md](docs/code-walkthrough.md) | 跟着一次 `-ask` 把整条链路读完（含自测题与答案要点） |
 | [docs/reading-guide.md](docs/reading-guide.md) | 按依赖顺序分 9 遍读代码，每遍只回答一个问题 |
-| [docs/demo.md](docs/demo.md) | 90 秒演示分镜（3+1 镜）：查真库 → 被权限拦住 → 审批后断点续跑 |
+| [docs/demo.md](docs/demo.md) | 90 秒演示分镜（3+1 镜）：查真库 → 被权限拦住 → 审批后断点续跑；附 GIF 生成方法 |
 | [docs/eval-report.md](docs/eval-report.md) | 评测报告：指标定义、逐题结果、局限说明、复现命令 |
 
 ---

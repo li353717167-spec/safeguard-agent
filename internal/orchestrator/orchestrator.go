@@ -90,6 +90,9 @@ type ToolTrace struct {
 	Error string
 	// Rejected 表示因为撞上限或权限策略而**没有真正执行**。
 	Rejected bool
+	// Pending 表示这次调用在等人工审批，同样**没有执行**。
+	// 与 Rejected 分开：一个是"被拒"，一个是"还没批"，日志与审计的读法完全不同。
+	Pending bool
 	// Class 是异常分类（ok / retryable / fatal / bad_input / circuit_open），来自执行器。
 	Class string
 	// Attempts 是实际尝试次数（含首次）。>1 说明发生过重试。
@@ -842,6 +845,7 @@ func (r *run) resolveApproval(ctx context.Context, tool tools.Tool, trace ToolTr
 
 	default: // pending
 		trace.Class = "waiting_approval"
+		trace.Pending = true
 		trace.IdemKey = idemKey
 		trace.Summary = fmt.Sprintf("等待人工审批：工单 %s（%s）", parked.Ticket.TicketID, preview)
 		r.auditApprovalRequested(ctx, stepNo, spec, r.auditTargetFallback(spec, call.Function.Arguments), parked.Ticket.TicketID, preview)

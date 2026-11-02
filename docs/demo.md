@@ -213,3 +213,36 @@ ffmpeg -i demo.mp4 \
 
 > "我让它重启一个服务：它没有执行，而是生成了一张工单；我批准之后，它从断点继续——
 > 用的还是原来那个步骤号，所以就算中途进程被杀掉，也不会重启第二次。"
+---
+
+## 附录：GIF 是怎么生成的
+
+README 里那张 GIF **不是录屏**，是"真实命令输出 → 渲染成终端帧"：
+
+```
+cmd/fake-llm（脚本模型，OpenAI 兼容）
+        │
+        ├─ go run ./cmd/agent -ask "重启 checkout-service"   → 真实编排 + 真实 MySQL，挂起等审批
+        ├─ -approvals / -approve / -resume / -audit          → 真实审批、续跑、审计链路
+        └─ 输出落盘 → demo/gif/scenes.json → demo/gif/make_gif.py → docs/assets/demo.gif
+```
+
+这样做的好处：**可复现**（同一个 commit 重新生成得到同样的 GIF）、**没有录屏噪音**、**体积小**（~0.5MB）。
+
+复现步骤：
+
+```bash
+go build -o .demo/agent.exe ./cmd/agent
+go build -o .demo/fake-llm.exe ./cmd/fake-llm
+.demo/fake-llm.exe -addr 127.0.0.1:18090 &          # 另开一个终端
+
+SAFEGUARD_LLM_BASE_URL=http://127.0.0.1:18090/v1 \
+SAFEGUARD_LLM_MODEL=demo-scripted \
+  .demo/agent.exe -ask "重启 checkout-service"
+# 再依次跑 -approvals / -approve / -resume / -audit，把输出整理进 demo/gif/scenes.json
+
+python demo/gif/make_gif.py
+```
+
+> 说明：`cmd/fake-llm` 只用于演示与联调——它按"有没有工具结果"决定返回工具调用还是最终答复。
+> 换成真实模型，同一条链路的行为完全一致（脚本只影响模型说什么，不影响权限、审批与落库）。
