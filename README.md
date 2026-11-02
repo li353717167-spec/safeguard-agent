@@ -220,7 +220,30 @@ SAFEGUARD_CONTEXT_MAX_TOOL_BYTES=2000  # 单条工具结果上限
 
 运行时能看到：`[轮次 3] 上下文估算 6120/6000 tokens（裁剪 2 条工具结果、折叠 2 轮）`。
 
-> 代码：`internal/orchestrator/budget.go`（`EstimateTokens` / `trimToolContent` / `compactMessages`）
+**策略是可插拔的**：压缩逻辑在 `internal/contextplan`，编排层只依赖 `Strategy` 接口。
+
+| 策略 | 行为 |
+|---|---|
+| `tiered`（默认） | 三层：最近 N 轮全量 / 中间 K 轮只留一行摘要 / 更早折叠成总结；**去重**同一查询；**失败调用永不丢** |
+| `trim-fold` | 只裁剪超长结果 + 折叠最老的整轮（最小可用版） |
+| `none` | 不压缩（做对照实验用） |
+
+```json
+// context-policy.json —— 改文件就能换策略，不用改代码
+{ "strategy": "tiered", "max_tokens": 6000, "keep_recent_rounds": 2,
+  "detail_rounds": 2, "dedupe": true, "keep_failures": true }
+```
+
+```bash
+SAFEGUARD_CONTEXT_STRATEGY=tiered
+SAFEGUARD_CONTEXT_POLICY=./context-policy.json   # 可选
+```
+
+**压缩是可逆的**：丢掉的内容会归档（`context_archive` 表），摘要行尾带 `[ctx:xxxxxxxx]`，
+模型可以调用 `recall_context` 按 ref 取回、或用关键词搜索本任务的归档。
+这样"省 token"和"查得到"就不冲突了——压缩只影响**工作记忆**，不影响**可检索的事实**。
+
+> 代码：`internal/contextplan/`（策略与注册）、`internal/tools/recall.go`（回查工具）、`internal/store/archiverepo.go`
 
 ### 9）模型端点：监控稳定性 + 丝滑切换
 

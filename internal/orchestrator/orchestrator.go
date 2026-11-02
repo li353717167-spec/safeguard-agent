@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/mechrevo/safeguard-agent/internal/approval"
+	"github.com/mechrevo/safeguard-agent/internal/contextplan"
 	"github.com/mechrevo/safeguard-agent/internal/executor"
 	"github.com/mechrevo/safeguard-agent/internal/llm"
 	"github.com/mechrevo/safeguard-agent/internal/policy"
@@ -169,8 +170,16 @@ type Options struct {
 	Gate *approval.Gate
 	// Auditor 是审计写入。留空则不记审计（评测与单测用）。
 	Auditor Auditor
-	// Budget 是上下文预算（发送前裁剪工具结果、折叠早期轮次）。零值用默认。
-	Budget  ContextBudget
+	// Budget 是上下文预算（多大算大）。零值用默认。
+	Budget ContextBudget
+	// Strategy 是压缩策略（怎么压）。留空则用内置 tiered。
+	//
+	// 之所以拆成"预算 + 策略"两个字段：预算跟着模型窗口走，策略跟着场景走，
+	// 而且策略可以由使用方自己注册（contextplan.Register）后传进来。
+	Strategy contextplan.Strategy
+	// Archive 是压缩归档（被丢掉的内容存这里，供 recall_context 回查）。
+	// 留空表示不归档：压缩照做，但摘要里的 ref 取不回来。
+	Archive ContextArchive
 	OnEvent func(Event)
 	now     func() time.Time
 }
@@ -185,6 +194,8 @@ type Orchestrator struct {
 	gate     *approval.Gate
 	auditor  Auditor
 	budget   ContextBudget
+	strategy contextplan.Strategy
+	archive  ContextArchive
 	opts     Options
 }
 
@@ -205,10 +216,23 @@ func New(client llm.Client, registry *tools.Registry, state StateStore, opts Opt
 	if opts.Policy == nil {
 		opts.Policy = policy.New()
 	}
+	if opts.Strategy == nil {
+		// 默认用分层策略：多数场景下它比"一刀切折叠"保留的信息更多。
+		if st, err := contextplan.New("tiered", contextplan.Config{
+			MaxTokens:        opts.Budget.MaxTokens,
+			KeepRecentRounds: opts.Budget.KeepRecentRounds,
+			MaxToolBytes:     opts.Budget.MaxToolResultBytes,
+		}); err == nil {
+			opts.Strategy = st
+		}
+	}
 	return &Orchestrator{
 		client: client, registry: registry, state: state,
 		runner: opts.Runner, policy: opts.Policy, gate: opts.Gate, auditor: opts.Auditor,
-		budget: opts.Budget.normalized(), opts: opts,
+		budget:   opts.Budget.normalized(),
+		strategy: opts.Strategy,
+		archive:  opts.Archive,
+		opts:     opts,
 	}
 }
 
@@ -647,6 +671,10 @@ func (r *run) processToolCall(ctx context.Context, round, stepNo int, call llm.T
 
 	// ⑥ 执行。超时、异常分类、退避重试、熔断在 D4 的执行器里；
 	//    D5 起由带落库的执行器接管：写意图 → 调下游 → 写结果，并支持回放。
+	// 把任务 id 注入 ctx：recall_context 只能查**当前任务**的归档，
+	// 工具本身拿不到编排层状态，所以走 ctx（和幂等 key 同一个模式）。
+	execCtx = tools.WithTaskID(execCtx, r.taskID)
+
 	out := r.o.runner.Run(execCtx, tool, json.RawMessage(call.Function.Arguments), executor.CallRef{
 		TaskID:    r.taskID,
 		StepNo:    stepNo,
