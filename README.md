@@ -91,6 +91,8 @@ go run ./cmd/agent -ask "checkout-service 最近是不是变慢了？"
 
 没有现成 MySQL？`docker compose up -d` 起一个（见 `docker-compose.yml`）。
 
+也提供预编译二进制（Linux/macOS/Windows，含 SHA256 校验和）：见 [Releases](https://github.com/li353717167-spec/safeguard-agent/releases)。
+
 再看一眼"可靠性长什么样"：
 
 ```bash

@@ -31,3 +31,6 @@ Thumbs.db
 
 # 本地演示产物（GIF 的原始抓取与中间帧；成品在 docs/assets/）
 /.demo/
+
+# 发布产物（在 dist/ 里，上传到 GitHub Release，不进仓库）
+/dist/

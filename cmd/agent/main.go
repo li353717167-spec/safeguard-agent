@@ -23,6 +23,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"runtime"
 	"sort"
 	"strings"
 	"syscall"
@@ -41,7 +42,12 @@ import (
 )
 
 // version 会在打 tag 时同步更新；用于确认二进制是不是最新构建。
-const version = "0.1.0-d3"
+// version 由构建时注入（-ldflags "-X main.version=v0.1.0"）。
+// 默认值只用于 go run：发布产物一定是显式注入过的，`-version` 能对上 tag。
+//
+// 刻意不注入 commit：发布提交本身无法包含自己的哈希，那会让"二进制里写的 commit"
+// 永远比 tag 落后一格。版本 + go 版本已经足够定位。
+var version = "0.1.0-dev"
 
 // 退出码约定：0 成功、1 运行失败、2 用法或配置错误。
 const (
@@ -103,7 +109,7 @@ func realMain(args []string) int {
 		return exitUsage
 	}
 	if *showVersion {
-		fmt.Println(version)
+		fmt.Printf("safeguard-agent %s\ngo %s\n", version, runtime.Version())
 		return exitOK
 	}
 
