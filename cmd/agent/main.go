@@ -577,6 +577,11 @@ func runListTools() int {
 		slog.Error("注册内置工具失败（启动门禁）", "err", err)
 		return exitFailure
 	}
+	// recall_context 也列出来：它是工具清单的一部分（没有归档时调用会提示未启用）。
+	if err := reg.Register(tools.NewRecallContext(nil)); err != nil {
+		slog.Error("注册 recall_context 失败", "err", err)
+		return exitFailure
+	}
 
 	fmt.Printf("--- 已注册工具（%d 个）---\n", reg.Len())
 	for _, e := range reg.Inventory() {
@@ -908,8 +913,8 @@ func runAsk(ctx context.Context, cfg config.Config, question string, timeoutOver
 	fmt.Printf("task_id=%s 停止原因=%s 轮次=%d 工具调用=%d 上限触发=%v\n",
 		res.TaskID, res.Stop, res.Rounds, res.ToolCalls, res.LimitTriggered())
 	if res.Context.Budget > 0 {
-		fmt.Printf("上下文: 估算 %d/%d tokens（裁剪 %d 条工具结果、折叠 %d 轮）\n",
-			res.Context.Tokens, res.Context.Budget, res.Context.Trimmed, res.Context.FoldedRounds)
+		fmt.Printf("上下文: 估算 %d/%d tokens（裁剪 %d 条、去重 %d 条、折叠 %d 轮）\n",
+			res.Context.Tokens, res.Context.Budget, res.Context.Trimmed, res.Context.Deduped, res.Context.FoldedRounds)
 	}
 	fmt.Printf("tokens: prompt=%d completion=%d total=%d\n",
 		res.Usage.PromptTokens, res.Usage.CompletionTokens, res.Usage.TotalTokens)
@@ -956,6 +961,8 @@ func printOrchestratorEvent(ev orchestrator.Event) {
 		}
 		status := "成功"
 		switch {
+		case ev.Trace.Pending:
+			status = "待审批"
 		case ev.Trace.Rejected:
 			status = "未执行"
 		case ev.Trace.Error != "":

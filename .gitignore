@@ -28,3 +28,6 @@
 # 操作系统
 .DS_Store
 Thumbs.db
+
+# 本地演示产物（GIF 的原始抓取与中间帧；成品在 docs/assets/）
+/.demo/

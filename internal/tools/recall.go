@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 	"unicode/utf8"
 )
 
@@ -65,6 +66,10 @@ func (t *recallTool) Spec() Spec {
 }`),
 		Tier:       TierHarmless,
 		Idempotent: true,
+		// 单条 SQL 查询：5 秒足够；仍然必须有超时（没有超时的调用会把循环拖死）。
+		Timeout:     5 * time.Second,
+		MaxRetry:    2,
+		BackoffBase: 100 * time.Millisecond,
 	}
 }
 
