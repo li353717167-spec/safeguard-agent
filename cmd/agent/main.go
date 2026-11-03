@@ -141,7 +141,7 @@ func realMain(args []string) int {
 
 	switch {
 	case *listTools:
-		return runListTools()
+		return runListTools(cfg)
 	case *listApprovals:
 		return runApprovals(ctx, cfg)
 	case strings.TrimSpace(*approve) != "":
@@ -576,7 +576,7 @@ func openGate(ctx context.Context, cfg config.Config) (*approval.Gate, *store.St
 
 // runListTools 打印工具清单与权限策略。
 // 它不需要数据库与模型，所以数据源传 nil——注册门禁校验的是定义，不是执行。
-func runListTools() int {
+func runListTools(cfg config.Config) int {
 	// nil 数据源：这里只取定义，不执行任何工具。
 	reg, err := tools.NewFullRegistry(nil, nil)
 	if err != nil {
@@ -586,6 +586,10 @@ func runListTools() int {
 	// recall_context 也列出来：它是工具清单的一部分（没有归档时调用会提示未启用）。
 	if err := reg.Register(tools.NewRecallContext(nil)); err != nil {
 		slog.Error("注册 recall_context 失败", "err", err)
+		return exitFailure
+	}
+	if err := registerShellTool(reg, cfg); err != nil {
+		slog.Error("注册 run_shell 失败", "err", err)
 		return exitFailure
 	}
 
@@ -764,6 +768,10 @@ func runResume(ctx context.Context, cfg config.Config, taskID string, timeoutOve
 		slog.Error("注册 recall_context 失败", "err", err)
 		return exitFailure
 	}
+	if err := registerShellTool(reg, cfg); err != nil {
+		slog.Error("注册 run_shell 失败", "err", err)
+		return exitFailure
+	}
 	strategy, err := newContextStrategy(cfg)
 	if err != nil {
 		slog.Error("压缩策略配置有误", "err", err)
@@ -854,6 +862,10 @@ func runAsk(ctx context.Context, cfg config.Config, question string, timeoutOver
 	archiveRepo := store.NewContextArchiveRepo(st.GORM())
 	if err := reg.Register(tools.NewRecallContext(archiveAdapter{repo: archiveRepo})); err != nil {
 		slog.Error("注册 recall_context 失败", "err", err)
+		return exitFailure
+	}
+	if err := registerShellTool(reg, cfg); err != nil {
+		slog.Error("注册 run_shell 失败", "err", err)
 		return exitFailure
 	}
 	strategy, err := newContextStrategy(cfg)
@@ -1203,4 +1215,54 @@ func toArchiveItem(e store.ContextArchiveEntry) tools.ArchiveItem {
 		Ref: e.Ref, Round: e.Round, Role: e.Role,
 		ToolName: e.ToolName, Content: e.Content, Tokens: e.Tokens,
 	}
+}
+
+// newShellConfig 把配置转成 tools.ShellConfig。
+func newShellConfig(cfg config.Config) tools.ShellConfig {
+	sc := tools.DefaultShellConfig()
+	sc.Enabled = cfg.Shell.Enabled
+	if strings.TrimSpace(cfg.Shell.ReadRules) != "" {
+		if rules, err := tools.ParseShellRules(cfg.Shell.ReadRules); err == nil && len(rules) > 0 {
+			sc.ReadOnly = rules
+		}
+	}
+	if strings.TrimSpace(cfg.Shell.WriteRules) != "" {
+		if rules, err := tools.ParseShellRules(cfg.Shell.WriteRules); err == nil && len(rules) > 0 {
+			sc.Mutating = rules
+		}
+	}
+	sc.WorkDir = cfg.Shell.WorkDir
+	if cfg.Shell.Timeout > 0 {
+		sc.Timeout = cfg.Shell.Timeout
+	}
+	if cfg.Shell.MaxOutputBytes > 0 {
+		sc.MaxOutputBytes = cfg.Shell.MaxOutputBytes
+	}
+	var roots []string
+	for _, r := range strings.Split(cfg.Shell.PathRoots, ",") {
+		if r = strings.TrimSpace(r); r != "" {
+			roots = append(roots, r)
+		}
+	}
+	if len(roots) > 0 {
+		sc.AllowedPathRoots = roots
+	}
+	return sc
+}
+
+// registerShellTool 注册两档 shell：
+//   - run_shell（只读，TierHarmless，默认无需审批）
+//   - run_shell_admin（变更，TierDangerous，每次审批）
+//
+// 分成两个工具而不是一个"动态降级"的工具，是因为 policy 里 dangerous 不可被 hook 放宽：
+// 一个工具只能有一个静态等级，两个等级就必须是两个工具。
+func registerShellTool(reg *tools.Registry, cfg config.Config) error {
+	sc := newShellConfig(cfg)
+	if !sc.Enabled {
+		return nil
+	}
+	if err := reg.Register(tools.NewShell(sc)); err != nil {
+		return err
+	}
+	return reg.Register(tools.NewShellAdmin(sc))
 }

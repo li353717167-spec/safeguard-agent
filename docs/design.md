@@ -1184,3 +1184,96 @@ type Strategy interface {
 > 丢掉的原文进归档表，摘要里留 ref，模型可以按 ref 取回或按关键词搜。
 > 同时策略是插件的：接口 + 注册表，配置能选内置策略，也能用 JSON 覆盖参数，二次开发者可以注册自己的。
 > 归档的权限边界靠 ctx 里的 task_id 卡死，回查还有长度上限，防止把省下的上下文又一次性撑满。"
+---
+
+## 24. Shell 工具（D21）：五道闸门，全部在代码里
+
+### 24.1 为什么它必须是最严格的一个
+
+其他工具的能力边界由**实现**决定（`update_config` 只能改配置），
+而 shell 的能力边界由**参数**决定——同一条通道既能 `df -h`，也能 `rm -rf /`。
+
+所以它不能靠"提示词请求模型别乱来"，必须把限制写进代码，并且**默认每次执行都要人批**。
+
+### 24.2 不起 shell：切词后直接 exec
+
+一版常见写法是 `exec.Command("bash", "-c", cmd)`——这一句就把所有注入面还给了输入。
+这里改为：自写词法分析器切 argv，然后 `exec.Command(argv[0], argv[1:]...)`。
+
+词法层**拒绝**：`; | & < > \` $ ( ) { } \` 与换行；支持单双引号（只是为了参数里能有空格）。
+代价是**不支持管道与重定向**——这是明确的取舍：能力换确定性。
+
+### 24.2b 读/写分两档：只读默认放行
+
+严格不等于"什么都要审批"：只读命令安全，逐条审批只会让人麻木地一路点"同意"。
+所以按风险分成两个工具：
+
+| 工具 | Tier | 审批 | 说明 |
+|---|---|---|---|
+| `run_shell` | 无害 | 不需要 | 只读清单：`df -h`、`uptime`、`journalctl -u` … |
+| `run_shell_admin` | 高危 | 每次 | 变更清单：`systemctl restart`、`docker restart` … |
+
+**为什么是两个工具而不是一个工具动态降级**：policy 的规则是"`TierDangerous` 不能被
+`ApprovalCheck` 放宽"（D6 的安全决定）。一个工具只能有一个静态等级，
+所以"读免审批、写必审批"只能表达成两个工具。
+
+只读档免审批，意味着**参数审查必须替审批人把关**——这就是 24.4 那条"私钥禁令"存在的原因：
+否则只读命令就成了"免审批地读走 `~/.ssh/id_rsa`"的通道。
+
+### 24.3 允许清单用"参数前缀"，不用正则
+
+```go
+{Exec: "df", Args: []string{"-h"}}          // 只允许 df -h ...
+{Exec: "journalctl", Args: []string{"-u"}}  // 只允许 journalctl -u ...
+```
+
+前缀可预测、可审计；正则写错一次就可能放行意外命令。
+清单外的命令**直接拒绝**（不是"提交审批"）——审批是给人看"要做什么"的，
+不是让人去审查一个任意命令。
+
+### 24.4 参数审查：命令合法 ≠ 参数安全
+
+`journalctl -u x --file /etc/shadow` 的执行文件在清单里，但参数能读密钥。所以再加两层：
+
+- 绝对路径必须落在 `AllowedPathRoots`（默认 `/var/log`、`/tmp`）；
+- 参数里出现 `.ssh`、`id_rsa`、`shadow`、`.env`、`..` 等片段直接拒绝。
+
+### 24.5 环境变量白名单：这是最容易漏的一刀
+
+Agent 进程的环境里有 `SAFEGUARD_DB_DSN` 与模型 API Key。
+如果 `cmd.Env = os.Environ()`，模型只要执行一次 `printenv`（或任何回显环境变量的命令）就全泄了。
+
+所以只透传：`PATH / HOME / LANG / LC_ALL / TZ / SystemRoot / TEMP / TMP / USERPROFILE / COMSPEC`。
+测试里专门断言：设置了 `SAFEGUARD_DB_DSN` 之后，`minimalEnv()` 里不含它。
+
+### 24.6 输出：遮罩 + 截断
+
+即使环境干净，命令输出仍可能带密钥（`systemctl status` 会回显 `Environment=`）。
+所以输出先过正则遮罩：`user:pass@host`、`password=`、`Authorization: Bearer ...` 全部换成 `***`。
+
+再按 `MaxOutputBytes`（默认 8KB）截断——否则 `journalctl -u x` 一次就能把上下文撑爆，
+把 D18/D20 的预算工作全部作废。
+
+### 24.7 审批与审计
+
+`TierDangerous` 在策略引擎里是**不可被 `ApprovalCheck` 放宽**的（D6 的决定），
+所以 shell 每次都会挂起；执行前写 `tool.executing`（写不进去就拒绝执行），
+审计的 `target` 是命令名、`mutating=true`。
+
+### 24.8 遗留风险（诚实写）
+
+1. **只终止直接子进程**：`CommandContext` 杀的是 exec 出来的进程，它再 fork 的孙进程可能残留。
+   生产环境应配合 cgroup（Linux）或 Job Object（Windows）。
+2. **允许清单可被管理员放宽**：一旦加入 `rm`，所有校验只剩"路径在根目录内"。
+   这是配置责任，不是代码能兜住的。
+3. **不做命令语义分析**：`df -h` 与 `df -h -x tmpfs` 都放行，后者更慢但仍安全；
+   真要按语义限制，需要每个命令的解析器，收益不抵成本。
+
+### 24.9 实测
+
+- 词法：`; | & > < \` $( )` 与换行全部拒绝；带引号参数正确切词；引号未闭合拒绝；
+- 清单：`df -h` 通过、`df -i` 拒绝、`/bin/df -h` 拒绝（防路径绕过）；
+- 参数：`/etc/shadow` 拒绝、`/var/log/app.log` 通过、`.ssh` 拒绝、参数过多拒绝；
+- 执行：成功返回结构化 stdout；非 0 退出返回 `ExitError`（带 stderr）；超时被终止；
+- 安全：DSN 与 token 被遮罩；`minimalEnv()` 不含任何 `SAFEGUARD_*`；
+- 真跑：`hostname` 真实执行成功（不是只测 mock）；注册门禁通过。
