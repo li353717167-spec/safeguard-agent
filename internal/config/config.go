@@ -23,6 +23,7 @@ type Config struct {
 	LLM      LLM
 	DB       DB
 	Context  Context
+	Shell    Shell
 	LogLevel string
 }
 
@@ -96,6 +97,22 @@ type Context struct {
 	PolicyPath string
 }
 
+// Shell 是 run_shell 工具的配置。
+type Shell struct {
+	// Enabled 决定是否注册 run_shell（默认 true；关闭后模型看不到这个工具）。
+	Enabled bool
+	// Rules 是允许清单：`exe arg1 arg2;exe2`（空则用内置默认清单）。
+	Rules string
+	// WorkDir 是固定工作目录（空则用进程当前目录）。
+	WorkDir string
+	// Timeout 是单次执行超时。
+	Timeout time.Duration
+	// MaxOutputBytes 是输出保留上限。
+	MaxOutputBytes int
+	// PathRoots 是允许出现在参数里的绝对路径根目录（逗号分隔）。
+	PathRoots string
+}
+
 // DB 是数据库侧配置。
 type DB struct {
 	DSN             string
@@ -146,6 +163,14 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	shellTimeout, err := durationEnv("SHELL_TIMEOUT", 10*time.Second)
+	if err != nil {
+		return Config{}, err
+	}
+	shellMaxOutput, err := intEnv("SHELL_MAX_OUTPUT", 8192)
+	if err != nil {
+		return Config{}, err
+	}
 
 	return Config{
 		LLM: LLM{
@@ -169,6 +194,14 @@ func Load() (Config, error) {
 			MaxToolResultBytes: ctxToolBytes,
 			Strategy:           stringEnv("CONTEXT_STRATEGY", "tiered"),
 			PolicyPath:         stringEnv("CONTEXT_POLICY", ""),
+		},
+		Shell: Shell{
+			Enabled:        boolEnv("SHELL_ENABLED", true),
+			Rules:          stringEnv("SHELL_RULES", ""),
+			WorkDir:        stringEnv("SHELL_WORKDIR", ""),
+			Timeout:        shellTimeout,
+			MaxOutputBytes: shellMaxOutput,
+			PathRoots:      stringEnv("SHELL_PATH_ROOTS", "/var/log,/tmp"),
 		},
 		LogLevel: stringEnv("LOG_LEVEL", "info"),
 	}, nil
@@ -247,4 +280,16 @@ func durationEnv(key string, def time.Duration) (time.Duration, error) {
 		return 0, fmt.Errorf("%s%s=%s 必须为正数", envPrefix, key, v)
 	}
 	return v, nil
+}
+
+// boolEnv 读取布尔开关（1/true/yes/on 与 0/false/no/off），无法识别时用默认值。
+func boolEnv(key string, def bool) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(envPrefix + key))) {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return def
+	}
 }
