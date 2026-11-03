@@ -101,8 +101,10 @@ type Context struct {
 type Shell struct {
 	// Enabled 决定是否注册 run_shell（默认 true；关闭后模型看不到这个工具）。
 	Enabled bool
-	// Rules 是允许清单：`exe arg1 arg2;exe2`（空则用内置默认清单）。
-	Rules string
+	// ReadRules 是只读档允许清单：`exe arg1 arg2;exe2`（空则用内置默认）。
+	ReadRules string
+	// WriteRules 是变更档允许清单（空则用内置默认）。
+	WriteRules string
 	// WorkDir 是固定工作目录（空则用进程当前目录）。
 	WorkDir string
 	// Timeout 是单次执行超时。
@@ -197,7 +199,8 @@ func Load() (Config, error) {
 		},
 		Shell: Shell{
 			Enabled:        boolEnv("SHELL_ENABLED", true),
-			Rules:          stringEnv("SHELL_RULES", ""),
+			ReadRules:      stringEnv("SHELL_READ_RULES", stringEnv("SHELL_RULES", "")),
+			WriteRules:     stringEnv("SHELL_WRITE_RULES", ""),
 			WorkDir:        stringEnv("SHELL_WORKDIR", ""),
 			Timeout:        shellTimeout,
 			MaxOutputBytes: shellMaxOutput,

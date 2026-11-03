@@ -18,7 +18,7 @@ func shellArgsJSON(cmd string) json.RawMessage {
 
 func testShell(runner shellRunner) *shellTool {
 	cfg := DefaultShellConfig()
-	cfg.Rules = []ShellRule{
+	cfg.ReadOnly = []ShellRule{
 		{Exec: "df", Args: []string{"-h"}},
 		{Exec: "journalctl", Args: []string{"-u"}},
 	}
@@ -228,7 +228,7 @@ func TestShellRunsRealCommand(t *testing.T) {
 		}
 	}
 	cfg := DefaultShellConfig()
-	cfg.Rules = []ShellRule{{Exec: bin}}
+	cfg.ReadOnly = []ShellRule{{Exec: bin}}
 	cfg.Timeout = 5 * time.Second
 	tool := NewShell(cfg)
 
@@ -238,5 +238,68 @@ func TestShellRunsRealCommand(t *testing.T) {
 	}
 	if strings.TrimSpace(res.Data.(map[string]any)["stdout"].(string)) == "" {
 		t.Error("hostname 应该非空输出")
+	}
+}
+
+// 只读档默认放行：TierHarmless、不需要审批。
+func TestShellReadNeedsNoApproval(t *testing.T) {
+	spec := NewShell(DefaultShellConfig()).Spec()
+	if spec.Tier != TierHarmless {
+		t.Errorf("只读档应是 TierHarmless，实际 %v", spec.Tier)
+	}
+	if spec.RequireApproval {
+		t.Error("只读档不该要求审批")
+	}
+}
+
+// 变更档必须审批，且绝不自动重试。
+func TestShellAdminNeedsApproval(t *testing.T) {
+	spec := NewShellAdmin(DefaultShellConfig()).Spec()
+	if spec.Tier != TierDangerous || !spec.RequireApproval {
+		t.Errorf("变更档应是 dangerous + 强制审批，实际 tier=%v approval=%v", spec.Tier, spec.RequireApproval)
+	}
+	if spec.MaxRetry != 0 {
+		t.Errorf("变更命令不该重试，实际 MaxRetry=%d", spec.MaxRetry)
+	}
+}
+
+// 只读档最关键的防线：**不能读私钥/凭据/配置**。
+func TestShellReadBlocksSecrets(t *testing.T) {
+	s := testShell(nil)
+
+	for _, cmd := range []string{
+		"df -h /tmp/.env",
+		"df -h /tmp/id_rsa",
+		"df -h /var/log/../etc/shadow",
+		"df -h /tmp/server.pem",
+		"df -h /tmp/credentials.json",
+		"df -h /tmp/.ssh/config",
+		"df -h /tmp/proc/self/environ",
+		"df -h /tmp/my-secret-key",
+	} {
+		if _, err := s.validate(shellArgsJSON(cmd)); err == nil {
+			t.Errorf("读私钥/凭据必须拒绝: %q", cmd)
+		}
+	}
+
+	// 正常的日志路径仍然放行
+	if _, err := s.validate(shellArgsJSON("df -h /var/log/app.log")); err != nil {
+		t.Errorf("正常路径不该被拒: %v", err)
+	}
+}
+
+// 变更档的清单是独立的：只读工具不允许 restart。
+func TestShellModeSeparatesAllowlists(t *testing.T) {
+	read := testShell(nil)
+	if _, err := read.validate(shellArgsJSON("systemctl restart checkout-service")); err == nil {
+		t.Error("只读档不允许 systemctl restart")
+	}
+
+	admin := &shellTool{cfg: DefaultShellConfig().Normalize(), mode: ShellWrite, runner: nil}
+	if _, err := admin.validate(shellArgsJSON("systemctl restart checkout-service")); err != nil {
+		t.Errorf("变更档应允许清单内的 restart: %v", err)
+	}
+	if _, err := admin.validate(shellArgsJSON("systemctl restart /tmp/.env")); err == nil {
+		t.Error("变更档同样不许碰敏感文件")
 	}
 }

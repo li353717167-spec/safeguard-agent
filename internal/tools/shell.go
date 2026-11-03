@@ -16,20 +16,28 @@ import (
 // ShellRule 是允许清单里的一条：可执行文件名 + 参数前缀。
 //
 // 用"参数前缀"而不是正则：前缀可预测、可审计，也不会因为正则写错而放行意外的命令。
-// 例如 {Exec:"systemctl", Args:["status"]} 只允许 `systemctl status ...`，
-// 不会允许 `systemctl restart ...`。
 type ShellRule struct {
 	Exec string
 	Args []string
 }
 
-// ShellConfig 是 shell 工具的配置。
-//
-// 默认值刻意保守：允许清单很短、超时 10 秒、输出 8KB、路径只允许 /var/log 与 /tmp。
+// ShellMode 决定这个 shell 工具的风险档位。
+type ShellMode int
+
+const (
+	// ShellRead 是只读档：TierHarmless，不审批，但**不能**碰私钥/配置/凭据。
+	ShellRead ShellMode = iota
+	// ShellWrite 是变更档：TierDangerous，每次都要人工审批。
+	ShellWrite
+)
+
+// ShellConfig 是 shell 工具的配置（读/写两档共用）。
 type ShellConfig struct {
 	Enabled bool
-	// Rules 是允许执行的命令清单（前缀匹配）。不在清单里的命令一律拒绝。
-	Rules []ShellRule
+	// ReadOnly 是只读档的允许清单（默认无需审批）。
+	ReadOnly []ShellRule
+	// Mutating 是变更档的允许清单（每次都要审批）。
+	Mutating []ShellRule
 	// WorkDir 是固定工作目录（空则用进程当前目录）。
 	WorkDir string
 	// Timeout 是单次执行超时。
@@ -44,19 +52,30 @@ type ShellConfig struct {
 	AllowedPathRoots []string
 }
 
-// DefaultShellConfig 返回默认配置（允许清单 + 保守限额）。
+// DefaultShellConfig 返回默认配置。
+//
+// 只读清单刻意短：每一项都是"看一眼系统状态"，不读任何用户文件。
+// 变更清单更短：只有明确会改系统、且必须审批的几类。
 func DefaultShellConfig() ShellConfig {
 	return ShellConfig{
 		Enabled: true,
-		Rules: []ShellRule{
+		ReadOnly: []ShellRule{
 			{Exec: "df", Args: []string{"-h"}},
 			{Exec: "free", Args: []string{"-h"}},
 			{Exec: "uptime"},
 			{Exec: "hostname"},
 			{Exec: "whoami"},
+			{Exec: "id"},
 			{Exec: "uname", Args: []string{"-a"}},
 			{Exec: "journalctl", Args: []string{"-u"}},
 			{Exec: "systemctl", Args: []string{"status"}},
+			{Exec: "docker", Args: []string{"ps"}},
+		},
+		Mutating: []ShellRule{
+			{Exec: "systemctl", Args: []string{"restart"}},
+			{Exec: "systemctl", Args: []string{"start"}},
+			{Exec: "systemctl", Args: []string{"stop"}},
+			{Exec: "docker", Args: []string{"restart"}},
 		},
 		Timeout:          10 * time.Second,
 		MaxOutputBytes:   8192,
@@ -87,6 +106,13 @@ func (c ShellConfig) Normalize() ShellConfig {
 	return c
 }
 
+func (c ShellConfig) rulesFor(mode ShellMode) []ShellRule {
+	if mode == ShellWrite {
+		return c.Mutating
+	}
+	return c.ReadOnly
+}
+
 // shellForbidden 是**壳元字符**黑名单。
 //
 // 我们根本不走 `sh -c`：命令被切成 argv 后直接 exec。
@@ -94,14 +120,27 @@ func (c ShellConfig) Normalize() ShellConfig {
 // 更糟的是将来某次重构真去调了 shell，这些输入就变成了注入。
 const shellForbidden = ";|&<>`$(){}\\"
 
-// deniedArgs 是"参数里出现就拒绝"的敏感片段。
+// deniedArgs 是"参数里出现就拒绝"的敏感片段（大小写不敏感）。
 //
-// 命令本身在允许清单里也不代表参数安全：`journalctl -u x --file /etc/shadow` 同样危险。
+// 这一层是给**只读档**兜底的：只读命令默认不需要审批，如果它还能读 `~/.ssh/id_rsa`，
+// "只读"就成了"免审批地读走所有密钥"。所以私钥、凭据、配置一律拦掉。
 var deniedArgs = []string{
-	"..", ".ssh", "id_rsa", "id_ed25519", "shadow", ".env", "credentials", ".kube",
+	// 私钥与 SSH
+	".ssh", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", "authorized_keys",
+	".gnupg", ".p12", ".pfx", ".pem", ".key", ".jks", ".keystore",
+	// 云与工具凭据
+	".aws", ".kube", ".docker/config.json", ".netrc", ".npmrc", ".pypirc",
+	".git-credentials", ".config/gcloud", ".azure", ".aliyun", ".tencentcloud",
+	// 通用配置/密钥
+	".env", "credentials", "secret", "token", "passwd", "shadow",
+	"kubeconfig", "serviceaccount",
+	// 进程环境（可能带密钥）
+	"/proc/self/environ", "/proc/1/environ", "environ",
+	// 路径穿越
+	"..",
 }
 
-// secretPatterns 用于把输出里的密钥遮掉：即使环境变量已经白名单化，
+// secretPatterns 用于把输出里的密钥遮掉：即使参数已经审过，
 // 命令的输出仍可能带上 DSN / token（例如 systemctl status 回显 Environment=）。
 var secretPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)\b(password|passwd|pwd|token|secret|api[_-]?key)\b\s*[=:]\s*\S+`),
@@ -119,9 +158,6 @@ type ShellError struct {
 func (e *ShellError) Error() string { return "run_shell 拒绝执行：" + e.Reason }
 
 // ExitError 表示命令真的跑了，但退出码非 0。
-//
-// 单独成类型：它不是"工具坏了"，而是"命令说你让它做的事没成功"，
-// 必须把 stdout/stderr 带回去，模型才能据此调整下一步。
 type ExitError struct {
 	Command string
 	Code    int
@@ -143,48 +179,66 @@ type shellArgs struct {
 	Command string `json:"command"`
 }
 
-// shellTool 是 run_shell 的实现。
+// shellTool 是 run_shell / run_shell_admin 的实现。
 //
 // 五道闸门，全部在代码里（不靠提示词）：
 //  1. 词法：拒绝一切壳元字符，切词后**直接 exec**，不起 shell；
-//  2. 允许清单：可执行文件 + 参数前缀必须命中，否则拒绝；
-//  3. 参数审查：路径必须在白名单根目录下，敏感片段（.ssh / shadow / ..）直接拒绝；
+//  2. 允许清单：可执行文件 + 参数前缀必须命中（读档与写档是两份清单）；
+//  3. 参数审查：路径必须在白名单根目录下，**私钥/凭据/配置片段一律拒绝**；
 //  4. 运行沙箱：固定工作目录、最小环境变量、超时、输出上限；
-//  5. 审批 + 审计：TierDangerous 强制人工审批，执行前写 tool.executing。
+//  5. 分级：只读档默认放行；变更档 TierDangerous 强制人工审批，执行前写审计。
 type shellTool struct {
 	cfg    ShellConfig
+	mode   ShellMode
 	runner shellRunner
 }
 
-// shellRunner 抽出来是为了测试超时与输出截断，不必真的起进程。
 type shellRunner func(ctx context.Context, argv []string, dir string, env []string, limit int) (stdout, stderr string, code int, truncated bool, err error)
 
-// NewShell 构造 run_shell 工具。
+// NewShell 构造**只读**档（默认无需审批）。
 func NewShell(cfg ShellConfig) Tool {
-	cfg = cfg.Normalize()
-	return &shellTool{cfg: cfg, runner: execShell}
+	return &shellTool{cfg: cfg.Normalize(), mode: ShellRead, runner: execShell}
+}
+
+// NewShellAdmin 构造**变更**档（每次都要审批）。
+func NewShellAdmin(cfg ShellConfig) Tool {
+	return &shellTool{cfg: cfg.Normalize(), mode: ShellWrite, runner: execShell}
+}
+
+func (t *shellTool) name() string {
+	if t.mode == ShellWrite {
+		return "run_shell_admin"
+	}
+	return "run_shell"
 }
 
 func (t *shellTool) Spec() Spec {
-	return Spec{
-		Name: "run_shell",
-		Description: "执行一条系统命令（只允许清单内的命令）。参数按空格分隔，**不支持**管道、重定向、" +
-			"变量替换、命令串联（`; | & > $ ( )` 等会被直接拒绝）。每次执行都必须人工审批；" +
-			"输出超过上限会被截断，超时会被终止。当前允许：\n" + formatRules(t.cfg.Rules),
+	read := t.mode == ShellRead
+
+	desc := "执行一条**只读**系统命令（默认无需审批）。参数按空格分隔，**不支持**管道、重定向、" +
+		"变量替换、命令串联（`; | & > $ ( )` 等会被直接拒绝）。" +
+		"为安全起见，读取私钥/凭据/配置文件（`.ssh`、`*.pem`、`id_rsa`、`.env`、`shadow`、`credentials` 等）一律拒绝。" +
+		"只能执行允许清单内的命令：\n" + formatRules(t.cfg.ReadOnly)
+	if !read {
+		desc = "执行一条**变更类**系统命令（每次都必须人工审批）。参数按空格分隔，**不支持**管道、重定向、" +
+			"变量替换、命令串联。读取私钥/凭据/配置文件一律拒绝。只能执行允许清单内的命令：\n" +
+			formatRules(t.cfg.Mutating)
+	}
+
+	spec := Spec{
+		Name:        t.name(),
+		Description: desc,
 		Parameters: json.RawMessage(`{
   "type": "object",
   "properties": {
-    "command": {"type": "string", "description": "完整命令，例如：journalctl -u checkout-service -n 50"}
+    "command": {"type": "string", "description": "完整命令，例如：df -h 或 journalctl -u checkout-service -n 50"}
   },
   "required": ["command"]
 }`),
-		Tier:            TierDangerous,
-		RequireApproval: true,
-		ApprovalRole:    "sre",
-		ApprovalTTL:     15 * time.Minute,
-		MaxRetry:        0, // 命令不幂等，绝不自动重试
-		Timeout:         t.cfg.Timeout + 5*time.Second,
-		Idempotent:      false,
+		Tier:       TierHarmless,
+		MaxRetry:   1, // 只读命令重试是安全的
+		Timeout:    t.cfg.Timeout + 5*time.Second,
+		Idempotent: true,
 		Preview: func(_ context.Context, rawArgs json.RawMessage) (string, error) {
 			argv, err := t.validate(rawArgs)
 			if err != nil {
@@ -195,11 +249,22 @@ func (t *shellTool) Spec() Spec {
 		Audit: func(rawArgs json.RawMessage) (string, bool, error) {
 			argv, err := t.validate(rawArgs)
 			if err != nil {
-				return "run_shell", false, nil
+				return t.name(), false, nil
 			}
-			return argv[0], true, nil // 命令可能改变系统，按"变更"审计
+			// 只读档不产生变更；变更档按"变更"审计。
+			return argv[0], !read, nil
 		},
 	}
+
+	if !read {
+		spec.Tier = TierDangerous
+		spec.RequireApproval = true
+		spec.ApprovalRole = "sre"
+		spec.ApprovalTTL = 15 * time.Minute
+		spec.MaxRetry = 0 // 变更命令绝不自动重试
+		spec.Idempotent = false
+	}
+	return spec
 }
 
 func (t *shellTool) Validate(rawArgs json.RawMessage) error {
@@ -236,6 +301,10 @@ func (t *shellTool) Invoke(ctx context.Context, rawArgs json.RawMessage) (Result
 		}
 	}
 
+	mode := "write"
+	if t.mode == ShellRead {
+		mode = "read"
+	}
 	data := map[string]any{
 		"command":     strings.Join(argv, " "),
 		"exit_code":   code,
@@ -243,6 +312,7 @@ func (t *shellTool) Invoke(ctx context.Context, rawArgs json.RawMessage) (Result
 		"stderr":      stderr,
 		"truncated":   truncated,
 		"duration_ms": elapsed.Milliseconds(),
+		"mode":        mode,
 	}
 	summary := fmt.Sprintf("执行 %s 成功（退出码 0，耗时 %s）", argv[0], elapsed.Round(time.Millisecond))
 	if truncated {
@@ -253,9 +323,7 @@ func (t *shellTool) Invoke(ctx context.Context, rawArgs json.RawMessage) (Result
 
 // validate 是五道闸门里的前三道（词法 / 允许清单 / 参数审查）。
 //
-// Validate 与 Invoke 都会调用它：注册门禁在"执行前"校验一次，
-// Invoke 再校验一次。看似重复，但这是 fail-closed 的代价——多一次纯函数调用，
-// 换"任何路径都不会绕过校验"。
+// Validate 与 Invoke 都会调用它：多一次纯函数调用，换"任何路径都不会绕过校验"。
 func (t *shellTool) validate(rawArgs json.RawMessage) ([]string, error) {
 	var args shellArgs
 	if err := json.Unmarshal(rawArgs, &args); err != nil {
@@ -281,31 +349,37 @@ func (t *shellTool) validate(rawArgs json.RawMessage) ([]string, error) {
 	}
 
 	// 不允许带路径的执行文件：`/bin/rm` 会绕过按名字匹配的允许清单。
-	execName := argv[0]
-	if strings.ContainsAny(execName, `/\`) {
+	if strings.ContainsAny(argv[0], `/\`) {
 		return nil, &ShellError{Reason: "可执行文件不能带路径（只允许按命令名匹配允许清单）"}
 	}
 
-	if !t.allowed(argv) {
-		return nil, &ShellError{Reason: fmt.Sprintf("命令 %q 不在允许清单内。允许的命令：\n%s", strings.Join(argv, " "), formatRules(t.cfg.Rules))}
+	rules := t.cfg.rulesFor(t.mode)
+	if !allowedByRules(rules, argv) {
+		return nil, &ShellError{Reason: fmt.Sprintf("命令 %q 不在%s允许清单内。允许的命令：\n%s",
+			strings.Join(argv, " "), t.modeLabel(), formatRules(rules))}
 	}
 
+	// 参数审查：既查"能不能读"，也查"能读到哪"。
 	for _, arg := range argv[1:] {
-		lower := strings.ToLower(arg)
-		for _, denied := range deniedArgs {
-			if strings.Contains(lower, denied) {
-				return nil, &ShellError{Reason: fmt.Sprintf("参数里包含被禁止的片段 %q", denied)}
-			}
+		if hit, bad := sensitiveFragment(arg); bad {
+			return nil, &ShellError{Reason: fmt.Sprintf("参数 %q 命中敏感片段 %q（不允许读取私钥/凭据/配置）", arg, hit)}
 		}
-		if strings.HasPrefix(arg, "/") && !t.pathAllowed(arg) {
+		if strings.HasPrefix(arg, "/") && !pathAllowed(t.cfg.AllowedPathRoots, arg) {
 			return nil, &ShellError{Reason: fmt.Sprintf("路径 %q 不在允许的根目录内（允许：%s）", arg, strings.Join(t.cfg.AllowedPathRoots, ", "))}
 		}
 	}
 	return argv, nil
 }
 
-func (t *shellTool) allowed(argv []string) bool {
-	for _, rule := range t.cfg.Rules {
+func (t *shellTool) modeLabel() string {
+	if t.mode == ShellWrite {
+		return "变更类"
+	}
+	return "只读"
+}
+
+func allowedByRules(rules []ShellRule, argv []string) bool {
+	for _, rule := range rules {
 		if rule.Exec != argv[0] {
 			continue
 		}
@@ -326,9 +400,22 @@ func (t *shellTool) allowed(argv []string) bool {
 	return false
 }
 
-func (t *shellTool) pathAllowed(p string) bool {
+// sensitiveFragment 判断参数是否指向私钥/凭据/配置。
+//
+// 大小写不敏感；命中即拒绝（不是遮罩——**读都不允许**）。
+func sensitiveFragment(arg string) (string, bool) {
+	lower := strings.ToLower(strings.ReplaceAll(arg, `\`, "/"))
+	for _, denied := range deniedArgs {
+		if strings.Contains(lower, denied) {
+			return denied, true
+		}
+	}
+	return "", false
+}
+
+func pathAllowed(roots []string, p string) bool {
 	clean := strings.ReplaceAll(p, `\`, "/")
-	for _, root := range t.cfg.AllowedPathRoots {
+	for _, root := range roots {
 		root = strings.TrimSuffix(strings.ReplaceAll(root, `\`, "/"), "/")
 		if clean == root || strings.HasPrefix(clean, root+"/") {
 			return true
@@ -407,9 +494,7 @@ func lexCommand(s string) ([]string, error) {
 
 // minimalEnv 是**最小环境变量**。
 //
-// 这一条是硬要求：Agent 进程的环境里有数据库 DSN、模型 API Key，
-// 直接透传等于把密钥交给每一条命令（`env` 一句就泄了）。
-// 所以只透传与"命令能不能跑"有关的变量，其余一律不传。
+// Agent 进程的环境里有数据库 DSN、模型 API Key，直接透传等于把密钥交给每一条命令。
 func minimalEnv() []string {
 	env := []string{"LANG=C.UTF-8", "LC_ALL=C.UTF-8", "TZ=UTC"}
 	for _, key := range []string{"PATH", "HOME", "SystemRoot", "TEMP", "TMP", "USERPROFILE", "COMSPEC"} {
@@ -479,7 +564,6 @@ func redactSecrets(s string) string {
 		s = re.ReplaceAllStringFunc(s, func(m string) string {
 			switch {
 			case strings.Contains(m, "://"):
-				// scheme://user:pass@host -> scheme://***@host
 				idx := strings.Index(m, "://")
 				at := strings.LastIndex(m, "@")
 				if at > idx {
@@ -525,9 +609,6 @@ func formatRules(rules []ShellRule) string {
 }
 
 // ParseShellRules 解析 `exe arg1 arg2;exe2 ...` 形式的允许清单。
-//
-// 用分号分隔规则、空格分隔参数：比 JSON 好写，也比正则安全（前缀匹配）。
-// 解析不了的条目直接丢弃并返回错误——宁可少放行，也不能"猜"。
 func ParseShellRules(s string) ([]ShellRule, error) {
 	var rules []ShellRule
 	for _, part := range strings.Split(s, ";") {

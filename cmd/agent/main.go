@@ -1221,9 +1221,14 @@ func toArchiveItem(e store.ContextArchiveEntry) tools.ArchiveItem {
 func newShellConfig(cfg config.Config) tools.ShellConfig {
 	sc := tools.DefaultShellConfig()
 	sc.Enabled = cfg.Shell.Enabled
-	if strings.TrimSpace(cfg.Shell.Rules) != "" {
-		if rules, err := tools.ParseShellRules(cfg.Shell.Rules); err == nil && len(rules) > 0 {
-			sc.Rules = rules
+	if strings.TrimSpace(cfg.Shell.ReadRules) != "" {
+		if rules, err := tools.ParseShellRules(cfg.Shell.ReadRules); err == nil && len(rules) > 0 {
+			sc.ReadOnly = rules
+		}
+	}
+	if strings.TrimSpace(cfg.Shell.WriteRules) != "" {
+		if rules, err := tools.ParseShellRules(cfg.Shell.WriteRules); err == nil && len(rules) > 0 {
+			sc.Mutating = rules
 		}
 	}
 	sc.WorkDir = cfg.Shell.WorkDir
@@ -1245,11 +1250,19 @@ func newShellConfig(cfg config.Config) tools.ShellConfig {
 	return sc
 }
 
-// registerShellTool 在开启时注册 run_shell（关闭时模型根本看不到它）。
+// registerShellTool 注册两档 shell：
+//   - run_shell（只读，TierHarmless，默认无需审批）
+//   - run_shell_admin（变更，TierDangerous，每次审批）
+//
+// 分成两个工具而不是一个"动态降级"的工具，是因为 policy 里 dangerous 不可被 hook 放宽：
+// 一个工具只能有一个静态等级，两个等级就必须是两个工具。
 func registerShellTool(reg *tools.Registry, cfg config.Config) error {
 	sc := newShellConfig(cfg)
 	if !sc.Enabled {
 		return nil
 	}
-	return reg.Register(tools.NewShell(sc))
+	if err := reg.Register(tools.NewShell(sc)); err != nil {
+		return err
+	}
+	return reg.Register(tools.NewShellAdmin(sc))
 }

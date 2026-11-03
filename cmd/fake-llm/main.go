@@ -47,8 +47,11 @@ func decide(req chatRequest) map[string]any {
 	}
 
 	if !hasToolResult {
+		if strings.Contains(lastUser, "hostname") || strings.Contains(lastUser, "主机名") {
+			return toolCallResponse("run_shell", `{"command":"hostname"}`)
+		}
 		if !strings.Contains(lastUser, "重启") {
-			return textResponse("我只能演示'重启服务'这一类请求；试试：重启 checkout-service")
+			return textResponse("我只能演示'重启服务'和'查主机名'两类请求；试试：重启 checkout-service / 查一下主机名")
 		}
 		return toolCallResponse("restart_service",
 			`{"service":"checkout-service","reason":"演示：用户要求重启"}`)
