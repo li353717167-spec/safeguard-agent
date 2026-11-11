@@ -343,6 +343,30 @@ go run ./cmd/agent -ask "看一下磁盘是不是满了"                        
 
 > 代码：`internal/tools/shell.go`（`lexCommand` / `validate` / `minimalEnv` / `redactSecrets`）
 
+### 11）Plan-and-Execute：先规划，再执行
+
+默认是 ReAct（每步问模型"下一步做什么"）。`-plan` 换成另一种"想"的方式：
+
+```
+一次规划（严格 JSON）→ 校验（工具必须存在 + 参数过工具自己的 Validate）→ 按计划逐条执行 → 一次总结
+```
+
+```
+$ go run ./cmd/agent -ask "payment-service 为什么变慢" -plan
+[计划] 计划（2 步）：1.query_metrics → 2.query_config
+[轮次 1] 工具 query_metrics 成功：...
+[轮次 2] 工具 query_config 成功：...
+--- 最终回答 ---
+```
+
+**每一步仍然走完全相同的安全链路**（策略判定 → 审批挂起 → 幂等落库 → 审计）——
+Plan 只改变"谁决定下一步"，不绕过任何管控。计划里出现 `restart_service` 一样会挂起等审批。
+
+结构上的差别：N 步任务，ReAct 要 N+1 次模型调用，Plan 固定 **2 次**（规划 + 总结）。
+代价是计划可能与现实脱节（数据变了、某步失败了），所以 v1 不做计划内重规划。
+
+> 代码：`internal/orchestrator/plan.go`（`ParsePlan` / `ValidatePlan` / `runPlan`）
+
 ## 怎么验证它真的对
 
 不是"没报错就算过"——
@@ -455,7 +479,10 @@ docs/                      # 架构图 / 设计决策 / 代码走读 / 阅读指
 9. **归档检索是 `LIKE` 包含匹配**：不是全文索引也不是向量检索；数据量小够用，规模上来要换。
 10. **归档随任务删除**（外键级联）：与审计相反——归档是执行状态，审计是证据。
 11. **Shell 不支持管道/重定向**：这是刻意的取舍——支持它们就得起 shell，注入面立刻回来。
-12. **Shell 只终止直接子进程**：`CommandContext` 杀的是命令本身，它再 fork 的孙进程可能残留；
+12. **Plan 模式不持久化计划**：中途挂起后恢复会按 ReAct 继续（已完成步骤仍被幂等 key 挡住、不会重复执行），
+    但后续步骤不再按原计划走。
+13. **Plan 模式不做计划内重规划**：某步失败后按计划继续，最终总结里如实说明失败项。
+14. **Shell 只终止直接子进程**：`CommandContext` 杀的是命令本身，它再 fork 的孙进程可能残留；
     真要上生产应配合 cgroup / Job Object 限制。
 
 ---

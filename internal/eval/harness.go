@@ -16,6 +16,8 @@ import (
 // Options 是评测运行参数。
 type Options struct {
 	Limits orchestrator.Limits
+	// Mode 是执行模式：react（默认）或 plan（先规划再执行）。
+	Mode string
 }
 
 // NewRunner 返回一个 Runner：每道题都装配一套**全新**的内存组件。
@@ -51,6 +53,7 @@ func NewRunner(model llm.Client, opts Options) Runner {
 			Limits: opts.Limits,
 			Gate:   gate,
 			Policy: policy.New(),
+			Mode:   opts.Mode,
 		})
 		return o.Run(ctx, c.Query)
 	}

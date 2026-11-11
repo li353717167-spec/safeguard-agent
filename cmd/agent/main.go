@@ -86,6 +86,8 @@ func realMain(args []string) int {
 	showRaw := fs.Bool("raw", false, "打印模型原始响应（排查用）")
 	timeout := fs.Duration("timeout", 0, "覆盖单次模型调用超时，例如 30s")
 	showVersion := fs.Bool("version", false, "打印版本号")
+	planMode := fs.Bool("plan", false, "配合 -ask：使用 Plan-and-Execute（先规划再执行）")
+	evalMode := fs.String("eval-mode", "react", "配合 -eval：react（默认）或 plan（对比两种策略）")
 	fs.Usage = func() {
 		fmt.Fprintf(fs.Output(), "safeguard-agent %s · 带权限管控与人工审批的运维 Agent\n\n", version)
 		fmt.Fprintf(fs.Output(), "用法:\n"+
@@ -108,6 +110,11 @@ func realMain(args []string) int {
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
 	}
+	mode := orchestrator.ModeReact
+	if *planMode {
+		mode = orchestrator.ModePlan
+	}
+
 	if *showVersion {
 		fmt.Printf("safeguard-agent %s\ngo %s\n", version, runtime.Version())
 		return exitOK
@@ -155,7 +162,7 @@ func realMain(args []string) int {
 	case *models:
 		return runModels(ctx, cfg, *probe)
 	case strings.TrimSpace(*evalCases) != "":
-		return runEval(ctx, cfg, strings.TrimSpace(*evalCases), *evalModel, *evalOut, *evalJudge, *timeout)
+		return runEval(ctx, cfg, strings.TrimSpace(*evalCases), *evalModel, *evalOut, *evalJudge, *timeout, *evalMode)
 	case *doMigrate:
 		return runMigrate(ctx, cfg)
 	case *doSeed:
@@ -163,7 +170,7 @@ func realMain(args []string) int {
 	case *dbPing:
 		return runDBPing(ctx, cfg)
 	case strings.TrimSpace(*ask) != "":
-		return runAsk(ctx, cfg, strings.TrimSpace(*ask), *timeout, *maxRounds, *maxToolCalls)
+		return runAsk(ctx, cfg, strings.TrimSpace(*ask), *timeout, *maxRounds, *maxToolCalls, mode)
 	case strings.TrimSpace(*toolProbe) != "":
 		return runToolProbe(ctx, cfg, strings.TrimSpace(*toolProbe), *timeout, *showRaw)
 	case strings.TrimSpace(*prompt) != "":
@@ -647,7 +654,7 @@ func runSeed(ctx context.Context, cfg config.Config) int {
 //   - fake：理想模型，用来验证**判分器**是对的（CI 用，不需要真模型，结果确定性）；
 //   - broken：故意犯错的模型，用来验证判分器**会**判失败；
 //   - real：真实模型，用来产出一份真实的能力报告（结果非确定性，需注明模型与时间）。
-func runEval(ctx context.Context, cfg config.Config, casesPath, modelMode, outPath string, modelJudge bool, timeoutOverride time.Duration) int {
+func runEval(ctx context.Context, cfg config.Config, casesPath, modelMode, outPath string, modelJudge bool, timeoutOverride time.Duration, mode string) int {
 	cases, err := eval.LoadCases(casesPath)
 	if err != nil {
 		slog.Error("加载评测集失败", "path", casesPath, "err", err)
@@ -679,7 +686,7 @@ func runEval(ctx context.Context, cfg config.Config, casesPath, modelMode, outPa
 	}
 
 	fmt.Printf("--- 评测开始：%d 个用例，模型 %s/%s ---\n", len(cases), provider, modelName)
-	results := eval.Evaluate(ctx, cases, eval.NewRunner(model, eval.Options{}))
+	results := eval.Evaluate(ctx, cases, eval.NewRunner(model, eval.Options{Mode: mode}))
 
 	// 语义判分（可选）：只作参考列，不改变 Pass 判定。
 	if modelJudge && model != nil {
@@ -831,7 +838,7 @@ func runResume(ctx context.Context, cfg config.Config, taskID string, timeoutOve
 	return exitOK
 }
 
-func runAsk(ctx context.Context, cfg config.Config, question string, timeoutOverride time.Duration, maxRounds, maxToolCalls int) int {
+func runAsk(ctx context.Context, cfg config.Config, question string, timeoutOverride time.Duration, maxRounds, maxToolCalls int, mode string) int {
 	if err := cfg.DB.Validate(); err != nil {
 		fmt.Fprintf(os.Stderr, "配置错误: %v\n", err)
 		return exitUsage
@@ -905,6 +912,7 @@ func runAsk(ctx context.Context, cfg config.Config, question string, timeoutOver
 		},
 		Strategy: strategy,
 		Archive:  archiveRepo,
+		Mode:     mode,
 		OnEvent:  printOrchestratorEvent,
 	})
 

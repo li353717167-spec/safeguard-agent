@@ -184,6 +184,8 @@ type Options struct {
 	// 之所以拆成"预算 + 策略"两个字段：预算跟着模型窗口走，策略跟着场景走，
 	// 而且策略可以由使用方自己注册（contextplan.Register）后传进来。
 	Strategy contextplan.Strategy
+	// Mode 是执行模式：react（默认，每步问模型）或 plan（先规划再执行）。
+	Mode string
 	// Archive 是压缩归档（被丢掉的内容存这里，供 recall_context 回查）。
 	// 留空表示不归档：压缩照做，但摘要里的 ref 取不回来。
 	Archive ContextArchive
@@ -464,6 +466,11 @@ func (o *Orchestrator) run(ctx context.Context, query string, resume *resumeStat
 		}); err != nil {
 			return r.res, err
 		}
+	}
+
+	// Plan 模式：一次规划、按计划执行；每一步仍走相同的策略/审批/幂等/审计链路。
+	if o.opts.Mode == ModePlan {
+		return r.runPlan(ctx, query, resume)
 	}
 
 	for {
